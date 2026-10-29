@@ -1,0 +1,11 @@
+# Backups & Temporary files
+*.bak
+*.tmp
+*.tmp.*
+*.swp
+*~
+
+# Logs & Environment
+*.log
+.env
+/var/lib/mint-admin/
