@@ -171,6 +171,13 @@ assert_true "run_guided_wizard function is defined" 'grep -q "^run_guided_wizard
 assert_true "CLI help mentions wizard command" './mint-admin.sh help | grep "wizard" >/dev/null'
 assert_true "Interactive menu lists Guided Wizard as Option 1" 'grep -A 12 "show_interactive_menu()" ./mint-admin.sh | grep -q "Guided Laptop Optimization Wizard"'
 
+# ------------------------------------------------------------------------------
+# Test 9: Discovery services default safety check
+# ------------------------------------------------------------------------------
+echo "--- Test 9: Network discovery services safe default ---"
+assert_true "disable_services defaults to 0 to prevent breaking network printers" 'grep -q "local disable_services=0" ./mint-admin.sh'
+assert_true "Warning displayed before disabling discovery services" 'grep -q "Disabling avahi-daemon/cups-browsed" ./mint-admin.sh'
+
 echo "=========================================================="
 if [ "$FAILED" -eq 0 ]; then
     echo "ALL $TOTAL TESTS PASSED SUCCESSFULLY!"

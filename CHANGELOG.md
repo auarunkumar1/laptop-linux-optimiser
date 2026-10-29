@@ -68,3 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **TOML Top-Level Directive Insertion**: Fixed Tor proxy directives placement in `dnscrypt-proxy.toml` to prevent table corruption and fatal configuration check errors.
 - **True Resolution Verification**: Validated DNS resolution through actual A-record address extraction across both local proxy (`127.0.2.1`) and system-wide resolver.
 - **Loopback IPv6 Preservation**: Ensured loopback (`lo`) IPv6 binding (`::1`) remains active when system-wide IPv6 is disabled to avoid breaking local services.
+
+### Fixed
+- **Network Printer & Discovery Daemon Safeguards**:
+  - Background discovery services (`avahi-daemon`, `cups-browsed`) now default to **safe/enabled** (`disable_services=0`), preventing unintended shutdown during non-interactive, scripted, or default wizard runs.
+  - Added warning banner in system tuning and guided wizard clarifying that disabling `avahi-daemon` prevents mDNS (`.local`) hostname resolution and breaks dynamically discovered (`dnssd://`) network printers.

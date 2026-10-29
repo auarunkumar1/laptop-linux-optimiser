@@ -1477,12 +1477,16 @@ EOF
     log_success "DHCP hostname leak protection active."
 
     # 4. Optional: Disable slow boot delays and background broadcast daemons
-    local disable_services=1
-    if [ "${FORCE_YES:-0}" -ne 1 ] && [ -t 0 ]; then
+    local disable_services=0
+    if [ "${FORCE_YES:-0}" -eq 1 ]; then
+        disable_services=0
+    elif [ -t 0 ]; then
         echo ""
+        log_warn "Disabling avahi-daemon/cups-browsed disables mDNS discovery and breaks dynamically discovered (dnssd://) network printers."
         read -r -p "Disable discovery background daemons (avahi-daemon, cups-browsed, ModemManager)? [y/N]: " daemon_ans
-        if [[ ! "$daemon_ans" =~ ^[Yy]$ ]]; then
-            disable_services=0
+        if [[ "$daemon_ans" =~ ^[Yy]$ ]]; then
+            disable_services=1
+        else
             log_info "Keeping background discovery daemons active."
         fi
     fi
