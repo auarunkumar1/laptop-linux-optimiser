@@ -1828,7 +1828,7 @@ run_guided_wizard() {
 }
 
 # ==============================================================================
-# MODULE 9: Profile Presets, Status Telemetry & System Advisory
+# MODULE 9: Profile Presets, System Status & Advisory
 # ==============================================================================
 
 get_active_preset() {
@@ -2275,7 +2275,7 @@ show_tui_dashboard() {
 echo -e "${CYAN}================================================================================${NC}"
         echo -e "  ${BOLD}${GREEN}⚡ Laptop Linux Optimizer & System Control Center (v${VERSION})${NC}"
         echo -e "${CYAN}================================================================================${NC}"
-        echo -e "  ${BOLD}SYSTEM TELEMETRY & HARDWARE STATUS${NC}"
+        echo -e "  ${BOLD}LIVE SYSTEM & HARDWARE STATUS${NC}"
         echo -e "  Active Preset   : ${GREEN}${BOLD}${cur_preset}${NC}"
         echo -e "  Battery Limit   : ${CYAN}${cur_bat}${NC}"
         echo -e "  ZRAM Swap       : ${GREEN}${cur_zram}${NC}"
@@ -2319,7 +2319,7 @@ echo -e "${CYAN}================================================================
         echo -e "  ${BOLD}10)${NC} Privacy & Anti-Tracking Scrub (Browser caches, recent docs)"
         echo -e "  ${BOLD}11)${NC} Automated Weekly Maintenance Timer (Systemd)"
         echo -e ""
-        echo -e "  ${BOLD}D)${NC} Dialog/Whiptail Mode   ${BOLD}R)${NC} Refresh Telemetry   ${BOLD}0/Q)${NC} Exit"
+        echo -e "  ${BOLD}D)${NC} Dialog/Whiptail Mode   ${BOLD}R)${NC} Refresh Status         ${BOLD}0/Q)${NC} Exit"
         echo -e "${CYAN}================================================================================${NC}"
         read -rp "Select an option [0-11, P, U, C, D, R, Q]: " opt
 

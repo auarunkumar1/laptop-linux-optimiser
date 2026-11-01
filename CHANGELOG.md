@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Interactive Terminal User Interface (TUI) Dashboard**:
-  - Full-screen high-contrast terminal user interface (`show_tui_dashboard()`) displaying real-time system telemetry and hardware status indicators.
+  - Full-screen high-contrast terminal user interface (`show_tui_dashboard()`) displaying real-time system and hardware status indicators.
   - Live indicators for **Active Preset**, **Battery Charge Limiter & State**, **ZRAM Compressed Swap**, **TCP BBR**, **Encrypted DNS**, **MAC Randomization**, **Weekly Timer**, and **IPv6 Stack**.
   - Proactive system maintenance advisory: dynamically checks for pending APT/Flatpak package updates and cleanable storage footprint, prompting user with quick one-key actions (`[U]` to update, `[C]` to sweep).
   - Modal GUI dialog mode via `whiptail` / `dialog` (`[D]` key or `mint-admin tui --dialog`).
@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ZRAM Device Release on Tuning Revert**:
   - Enhanced `revert_system_tuning()` to explicitly execute `swapoff /dev/zram*` and `zramctl --reset` to ensure memory is released back to the operating system.
 - **Test Suite Expansion**:
-  - Expanded test suite from 26 to 42 tests in `tests/test_audit_fixes.sh`, adding test coverage for presets, TUI dashboard, status telemetry, canonical path installation, and cache symlink protection.
+  - Expanded test suite from 26 to 49 tests in `tests/test_audit_fixes.sh`, adding test coverage for presets, TUI dashboard, system status checks, canonical path installation, and cache symlink protection.
 - **IPv6 Protocol Control & Instant Toggle**:
   - Implemented `toggle_ipv6()` with automatic state detection, allowing 1-click toggling between enabled and disabled (with loopback `::1` preservation) in the TUI Dashboard, Whiptail dialogs, and CLI (`mint-admin ipv6 toggle`).
   - Added dedicated CLI commands: `mint-admin ipv6 [status | toggle | disable | enable]`.

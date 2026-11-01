@@ -21,7 +21,7 @@
 | 📦 **Housekeeping** | **Package & System Sweep** | APT update & `dist-upgrade` with non-interactive conffile protection, Flatpak system/user runtime cleanup, systemd journal rotation/vacuuming, and residual package (`rc`) purging. |
 | ⏱️ **Automation** | **Weekly Systemd Timer** | Automated weekly background maintenance schedule executing with root-owned binary security (`/usr/local/sbin/mint-admin`), space-safe quoting, and privilege safety checks. |
 | 🎛️ **Profile Presets** | **One-Click Presets** | Fast toggling between **Desk / AC Docked** (60% battery, BBR, ZRAM), **Balanced Daily** (80% battery, BBR, ZRAM), **Travel / Mobile** (100% capacity), and **Custom**. |
-| 🖥️ **Terminal UI** | **Interactive TUI Dashboard** | High-contrast full-screen TUI dashboard with live telemetry indicators (Battery %, ZRAM, BBR, DNS, MAC, Timer), proactive update/cleanup alerts with 1-key actions, and Whiptail GUI modal support. |
+| 🖥️ **Terminal UI** | **Interactive TUI Dashboard** | High-contrast full-screen TUI dashboard with live status indicators (Battery %, ZRAM, BBR, DNS, MAC, Timer), proactive update/cleanup alerts with 1-key actions, and Whiptail GUI modal support. |
 
 ---
 
@@ -227,9 +227,9 @@ Tests cover:
 
 ## Roadmap & Planned Features
 
-- [x] **Interactive TUI Dashboard (v0.2.0)**: Modern text user interface (TUI) with interactive menus, live system telemetry (Battery limit & charging state, ZRAM utilization, BBR, DNS, MAC, Timer), proactive update/cleanup prompts, and Whiptail modal dialog support.
+- [x] **Interactive TUI Dashboard (v0.2.0)**: Modern text user interface (TUI) with interactive menus, live system status indicators (Battery limit & charging state, ZRAM utilization, BBR, DNS, MAC, Timer), proactive update/cleanup prompts, and Whiptail modal dialog support.
 - [x] **Profile Presets (v0.2.0)**: One-click switching between *Desk / AC Docked* (60% battery, BBR, ZRAM), *Balanced Daily* (80% battery, BBR, ZRAM), and *Travel / Ultra-Battery Saver* (100% battery, full mobile capacity).
-- [ ] **Hardware Telemetry Graphing**: Thermal zone sensors and real-time battery milliwatt discharge rate graph in TUI.
+- [ ] **Hardware Sensor Monitoring**: Thermal zone sensors and real-time battery milliwatt discharge rate graph in TUI.
 
 ---
 

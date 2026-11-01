@@ -189,9 +189,9 @@ assert_true "CLI help mentions preset command" './mint-admin.sh help | grep "pre
 assert_true "Preset status reports valid active profile" './mint-admin.sh preset status | grep -q "Active Profile Preset"'
 
 # ------------------------------------------------------------------------------
-# Test 11: Real-time Telemetry & Status Indicators
+# Test 11: Real-time System Status Indicators
 # ------------------------------------------------------------------------------
-echo "--- Test 11: Real-time Telemetry & Status Indicators ---"
+echo "--- Test 11: Real-time System Status Indicators ---"
 assert_true "status_get_preset is defined" 'grep -q "^status_get_preset()" ./mint-admin.sh'
 assert_true "status_get_battery is defined" 'grep -q "^status_get_battery()" ./mint-admin.sh'
 assert_true "status_get_zram is defined" 'grep -q "^status_get_zram()" ./mint-admin.sh'
