@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 SCRIPT_PATH="$(realpath "$0")"
 
 # Colors & Formatting

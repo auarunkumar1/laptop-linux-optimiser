@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.2.1] - 2026-11-01
+
+### Changed
+- **UI & Terminology Refinement**:
+  - Replaced all dashboard occurrences of the term "telemetry" with "Live System Status" (`LIVE SYSTEM & HARDWARE STATUS` and `Refresh Status`) to eliminate user privacy concerns and reinforce that all subsystem health checks are strictly local.
+  - Updated documentation, test suite descriptions, and roadmap items to use clean status reporting terminology.
+
 ## [v0.2.0] - 2026-11-01
 
 ### Added

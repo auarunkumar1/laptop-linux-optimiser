@@ -1,6 +1,6 @@
 # Laptop Linux Optimizer (`laptop-linux-optimiser`)
 
-[![Release](https://img.shields.io/badge/version-v0.2.0-blue.svg)](https://github.com/auarunkumar1/laptop-linux-optimiser/releases)
+[![Release](https://img.shields.io/badge/version-v0.2.1-blue.svg)](https://github.com/auarunkumar1/laptop-linux-optimiser/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20Mint%20%7C%20Ubuntu%20%7C%20Debian-lightgrey.svg)]()
 [![Shell](https://img.shields.io/badge/shell-bash%20%3E%3D%204.4-brightgreen.svg)]()
