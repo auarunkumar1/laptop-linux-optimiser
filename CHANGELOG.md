@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.2.0] - 2026-11-01
+
+### Added
+- **Interactive Terminal User Interface (TUI) Dashboard**:
+  - Full-screen high-contrast terminal user interface (`show_tui_dashboard()`) displaying real-time system telemetry and hardware status indicators.
+  - Live indicators for **Active Preset**, **Battery Charge Limiter & State**, **ZRAM Compressed Swap**, **TCP BBR**, **Encrypted DNS**, **MAC Randomization**, **Weekly Timer**, and **IPv6 Stack**.
+  - Proactive system maintenance advisory: dynamically checks for pending APT/Flatpak package updates and cleanable storage footprint, prompting user with quick one-key actions (`[U]` to update, `[C]` to sweep).
+  - Modal GUI dialog mode via `whiptail` / `dialog` (`[D]` key or `mint-admin tui --dialog`).
+  - Isolated action runner (`run_menu_action`) to protect TUI session from termination if underlying subcommands return non-zero.
+- **Profile Presets Management (`mint-admin preset`)**:
+  - One-click profile preset switching between **Desk / AC Docked** (60% battery threshold + BBR + ZRAM), **Balanced Daily** (80% battery threshold + BBR + ZRAM), **Travel / Mobile** (100% full capacity), and **Custom**.
+  - Persistent profile tracking in `/etc/mint-admin-profile.conf`.
+  - CLI commands: `mint-admin preset [status | apply <desk|balanced|travel> | desk | balanced | travel]`.
+  - Integrated preset selection directly into TUI and Guided Optimization Wizard.
+- **System Maintenance Advisory CLI (`mint-admin check`)**:
+  - Instant inspection of pending package updates and cleanable cache storage.
+
+### Fixed & Hardened (Audit Findings)
+- **Zero-Argument Argument Parsing Regression**:
+  - Fixed `for arg in "${@:-}"` bug where an empty invocation expanded to a single empty string `""`, causing spurious `Unknown command: ''` failures. Corrected to native `for arg in "$@"`.
+- **Systemd Timer Privilege Escalation Hardening**:
+  - In `install_weekly_timer()`, prevented running user-writable scripts under root by copying/installing root-owned canonical binary to `/usr/local/sbin/mint-admin` (mode 0755, `root:root`) if invoked from a non-root or home directory.
+  - Properly quoted `Documentation` URL file paths to prevent space-path unit parsing errors.
+- **User Cache Symlink Protection**:
+  - Hardened `clean_user_cache()` against directory symlink attacks across user homes (`/root /home/*`), requiring directory verification (`! -L`) and `-type f ! -type l` file deletion matching `clean_privacy()`.
+- **Root Filesystem Space Metric Consistency**:
+  - Standardized free-space metric gathering across `run_optimizer()`, `update_and_clean()`, and `run_full_update_and_optimizer()` using `df -k / 2>/dev/null | awk 'END {print $4}'` with numeric fallback guards.
+- **Package Purge Safety in `clean_apt()`**:
+  - Piped residual package lists into `xargs -r dpkg --purge` to prevent word-splitting and command length limit issues.
+- **ZRAM Device Release on Tuning Revert**:
+  - Enhanced `revert_system_tuning()` to explicitly execute `swapoff /dev/zram*` and `zramctl --reset` to ensure memory is released back to the operating system.
+- **Test Suite Expansion**:
+  - Expanded test suite from 26 to 42 tests in `tests/test_audit_fixes.sh`, adding test coverage for presets, TUI dashboard, status telemetry, canonical path installation, and cache symlink protection.
+- **IPv6 Protocol Control & Instant Toggle**:
+  - Implemented `toggle_ipv6()` with automatic state detection, allowing 1-click toggling between enabled and disabled (with loopback `::1` preservation) in the TUI Dashboard, Whiptail dialogs, and CLI (`mint-admin ipv6 toggle`).
+  - Added dedicated CLI commands: `mint-admin ipv6 [status | toggle | disable | enable]`.
+
 ## [v0.1.1] - 2026-11-01
 
 ### Fixed

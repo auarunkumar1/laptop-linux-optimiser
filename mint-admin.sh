@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.1"
+VERSION="0.2.0"
 SCRIPT_PATH="$(realpath "$0")"
 
 # Colors & Formatting
@@ -54,6 +54,8 @@ DHCP_PRIVACY_CONF="/etc/NetworkManager/conf.d/01-privacy-dhcp.conf"
 ZRAM_CONF="/etc/default/zramswap"
 IPV6_SYSCTL_CONF="/etc/sysctl.d/99-disable-ipv6.conf"
 BASELINE_SYSCTL="/var/lib/mint-admin/tuning-baseline.env"
+PROFILE_CONF="/etc/mint-admin-profile.conf"
+CANONICAL_BIN="/usr/local/sbin/mint-admin"
 
 # ------------------------------------------------------------------------------
 # Helper Utilities
@@ -1110,8 +1112,7 @@ clean_apt() {
     rc_pkgs=$(dpkg -l 2>/dev/null | awk '/^rc/ {print $2}')
     if [ -n "$rc_pkgs" ]; then
         echo "  - Purging residual configurations: $rc_pkgs"
-        # shellcheck disable=SC2086
-        dpkg --purge $rc_pkgs 2>/dev/null || true
+        echo "$rc_pkgs" | xargs -r dpkg --purge 2>/dev/null || true
     else
         echo "  - No residual configuration packages found."
     fi
@@ -1172,11 +1173,17 @@ clean_systemd() {
 
 clean_user_cache() {
     echo ">>> Stale Caches & Safe Temp Cleanups..."
-    echo "  - Cleaning stale thumbnail caches older than 14 days..."
-    find /home/*/.cache/thumbnails /root/.cache/thumbnails -type f -mtime +14 -delete 2>/dev/null || true
+    echo "  - Cleaning stale thumbnail caches older than 14 days (symlink protected)..."
+    for h in /root /home/*; do
+        [ -d "$h" ] || continue
+        [ -L "$h" ] && continue
+        if [ -d "$h/.cache/thumbnails" ] && [ ! -L "$h/.cache/thumbnails" ]; then
+            find "$h/.cache/thumbnails" -mindepth 1 -maxdepth 4 -type f ! -type l -mtime +14 -delete 2>/dev/null || true
+        fi
+    done
 
     echo "  - Pruning old /var/tmp residual files (> 30 days old)..."
-    find /var/tmp -mindepth 1 -maxdepth 3 -type f -mtime +30 -delete 2>/dev/null || true
+    find /var/tmp -mindepth 1 -maxdepth 3 -type f ! -type l -mtime +30 -delete 2>/dev/null || true
 
     echo "[+] Cache housekeeping complete."
     echo ""
@@ -1192,7 +1199,8 @@ run_optimizer() {
     echo ""
 
     local avail_before
-    avail_before=$(df -k / | awk 'NR==2 {print $4}')
+    avail_before=$(df -k / 2>/dev/null | awk 'END {print $4}')
+    [[ "$avail_before" =~ ^[0-9]+$ ]] || avail_before=0
     echo "[*] Initial free space on root filesystem: $(format_kb "$avail_before")"
     echo ""
 
@@ -1213,7 +1221,8 @@ update_and_clean() {
     echo ""
 
     local avail_before
-    avail_before=$(df -k / | awk 'NR==2 {print $4}')
+    avail_before=$(df -k / 2>/dev/null | awk 'END {print $4}')
+    [[ "$avail_before" =~ ^[0-9]+$ ]] || avail_before=0
     echo "[*] Initial free space on root filesystem: $(format_kb "$avail_before")"
     echo ""
 
@@ -1288,22 +1297,25 @@ install_weekly_timer() {
 
     log_info "Setting up weekly automated maintenance timer..."
 
+    local exec_target="$SCRIPT_PATH"
     local owner_uid
     owner_uid=$(stat -c '%u' "$SCRIPT_PATH" 2>/dev/null || echo "0")
-    if [ "$owner_uid" != "0" ]; then
-        log_warn "Notice: '$SCRIPT_PATH' is owned by UID $owner_uid (non-root)."
-        log_warn "The weekly systemd timer will run this script with root privileges."
+    if [ "$owner_uid" != "0" ] || [[ "$SCRIPT_PATH" == /home/* ]]; then
+        log_info "Securing systemd timer: installing root-owned script to $CANONICAL_BIN..."
+        mkdir -p /usr/local/sbin
+        install -m 755 -o root -g root "$SCRIPT_PATH" "$CANONICAL_BIN" 2>/dev/null || cp "$SCRIPT_PATH" "$CANONICAL_BIN"
+        [ -x "$CANONICAL_BIN" ] && exec_target="$CANONICAL_BIN"
     fi
 
     cat << EOF > "$OPTIMIZER_SERVICE"
 [Unit]
 Description=Linux Mint Weekly System Optimizer & Housekeeping
-Documentation=file://$SCRIPT_PATH
+Documentation=file://$exec_target
 After=network.target
 
 [Service]
 Type=oneshot
-ExecStart="$SCRIPT_PATH" optimize
+ExecStart="$exec_target" optimize
 Nice=19
 IOSchedulingClass=idle
 EOF
@@ -1329,6 +1341,7 @@ EOF
     systemctl restart mint-optimizer.timer 2>/dev/null || true
 
     log_success "Weekly optimization timer installed and activated!"
+    echo "    - Target    : $exec_target optimize"
     echo "    - Frequency : Every Sunday at 03:00 AM (runs upon next boot if laptop was asleep/off)"
     echo "    - Logs      : journalctl -u mint-optimizer.service"
 }
@@ -1602,9 +1615,11 @@ revert_system_tuning() {
     systemctl enable --now cups-browsed 2>/dev/null || true
     systemctl enable --now ModemManager 2>/dev/null || true
 
-    # Disable ZRAM and remove config if user reverts
+    # Disable ZRAM, swap off active zram devices, and remove config if user reverts
     systemctl stop zramswap.service 2>/dev/null || true
     systemctl disable zramswap.service 2>/dev/null || true
+    swapoff /dev/zram* 2>/dev/null || true
+    command -v zramctl &>/dev/null && zramctl --reset /dev/zram* 2>/dev/null || true
     rm -f "$ZRAM_CONF"
 
     nmcli general reload 2>/dev/null || systemctl reload NetworkManager 2>/dev/null || true
@@ -1612,7 +1627,7 @@ revert_system_tuning() {
 }
 
 # ==============================================================================
-# MODULE 8: IPv6 Protocol Management
+# MODULE 8: IPv6 Protocol Control & Toggle
 # ==============================================================================
 
 show_ipv6_status() {
@@ -1624,7 +1639,7 @@ show_ipv6_status() {
     if [ "$ipv6_dis" -eq 1 ]; then
         echo -e "System IPv6 State : ${RED}DISABLED (Blocked)${NC}"
         echo "  - No IPv6 traffic will be transmitted or received."
-        echo "  - Prevents IPv6 leaks on VPNs and untrusted Wi-Fi."
+        echo "  - Loopback ::1 remains preserved for local service sockets."
     else
         echo -e "System IPv6 State : ${GREEN}ENABLED (Active)${NC}"
         local addrs
@@ -1637,9 +1652,9 @@ show_ipv6_status() {
         fi
     fi
     if [ -f "$IPV6_SYSCTL_CONF" ]; then
-        echo "Persistence       : Persistent configuration active in $IPV6_SYSCTL_CONF"
+        echo "Configuration     : Config file present in $IPV6_SYSCTL_CONF"
     else
-        echo "Persistence       : Standard kernel defaults"
+        echo "Configuration     : Standard system defaults"
     fi
     echo -e "${CYAN}========================================================${NC}"
 }
@@ -1663,8 +1678,9 @@ EOF
             echo 1 > "$iface/disable_ipv6" 2>/dev/null || true
         fi
     done
+    nmcli general reload 2>/dev/null || true
 
-    log_success "IPv6 has been disabled across network interfaces (localhost ::1 preserved)."
+    log_success "IPv6 has been DISABLED across network interfaces (localhost ::1 preserved)."
 }
 
 enable_ipv6() {
@@ -1680,7 +1696,17 @@ enable_ipv6() {
     done
     nmcli general reload 2>/dev/null || true
 
-    log_success "IPv6 has been enabled across all interfaces."
+    log_success "IPv6 has been ENABLED across all network interfaces."
+}
+
+toggle_ipv6() {
+    local ipv6_dis
+    ipv6_dis=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "0")
+    if [ "$ipv6_dis" -eq 1 ]; then
+        enable_ipv6
+    else
+        disable_ipv6
+    fi
 }
 
 # ==============================================================================
@@ -1802,166 +1828,633 @@ run_guided_wizard() {
 }
 
 # ==============================================================================
-# Master Interactive Dashboard
+# MODULE 9: Profile Presets, Status Telemetry & System Advisory
 # ==============================================================================
 
-show_interactive_menu() {
+get_active_preset() {
+    if [ -f "$PROFILE_CONF" ]; then
+        local p
+        p=$(grep "^PROFILE=" "$PROFILE_CONF" 2>/dev/null | cut -d= -f2 || echo "")
+        [ -n "$p" ] && echo "$p" && return
+    fi
+    local thresh bbr zram
+    thresh=$(cat /sys/class/power_supply/BAT*/charge_control_end_threshold 2>/dev/null | head -n1 || echo "")
+    bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+    zram=0
+    swapon --show 2>/dev/null | grep -q "zram" && zram=1
+
+    if [ "$thresh" = "60" ] && [ "$bbr" = "bbr" ] && [ "$zram" -eq 1 ]; then
+        echo "desk"
+    elif [ "$thresh" = "80" ] && [ "$bbr" = "bbr" ] && [ "$zram" -eq 1 ]; then
+        echo "balanced"
+    elif [ "$thresh" = "100" ]; then
+        echo "travel"
+    else
+        echo "custom"
+    fi
+}
+
+status_get_preset() {
+    local preset
+    preset=$(get_active_preset)
+    case "$preset" in
+        desk) echo "Desk / Docked (60% Limit + BBR + ZRAM)" ;;
+        balanced) echo "Balanced Daily (80% Limit + BBR + ZRAM)" ;;
+        travel) echo "Travel / Mobile (100% Full Capacity)" ;;
+        *) echo "Custom Configuration" ;;
+    esac
+}
+
+status_get_battery() {
+    local bat
+    bat=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -n1 || true)
+    if [ -z "$bat" ] || [ ! -d "$bat" ]; then
+        echo "No Battery Detected"
+        return
+    fi
+    local cap state thresh
+    cap=$(cat "$bat/capacity" 2>/dev/null || echo "?")
+    state=$(cat "$bat/status" 2>/dev/null || echo "Unknown")
+    thresh=$(cat "$bat/charge_control_end_threshold" 2>/dev/null || echo "100")
+    local persist="Session"
+    if [ -f "$BATTERY_SERVICE" ] && systemctl is-enabled --quiet asus-battery-limit.service 2>/dev/null; then
+        persist="Persistent"
+    fi
+    echo "${thresh}% Limit [${persist}] | ${cap}% (${state})"
+}
+
+status_get_zram() {
+    if swapon --show 2>/dev/null | grep -q "zram"; then
+        local sz swap
+        sz=$(swapon --show 2>/dev/null | grep "zram" | awk '{print $3}' | head -n1)
+        swap=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "60")
+        echo "ACTIVE (${sz}, swappiness ${swap})"
+    else
+        echo "INACTIVE"
+    fi
+}
+
+status_get_bbr() {
+    local cc qdisc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "Unknown")
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "Unknown")
+    if [ "$cc" = "bbr" ]; then
+        echo "BBR (Optimal, qdisc: ${qdisc})"
+    else
+        echo "${cc} (Legacy)"
+    fi
+}
+
+status_get_dns() {
+    if systemctl is-active --quiet dnscrypt-proxy.service 2>/dev/null; then
+        local svr="Encrypted"
+        if [ -f "$DNS_CONFIG" ]; then
+            if awk '/^\[/{exit} /proxy =/{found=1} END{exit !found}' "$DNS_CONFIG" 2>/dev/null; then
+                svr="Tor Onion DNS (127.0.2.1)"
+            elif grep -q "routes = \[{ server_name='\*'" "$DNS_CONFIG" 2>/dev/null; then
+                svr="Anonymized Relays (127.0.2.1)"
+            else
+                local sname
+                sname=$(grep -E "^server_names =" "$DNS_CONFIG" 2>/dev/null | cut -d= -f2- | tr -d "[] \"'" | tr "," " " | awk '{print $1}')
+                svr="${sname:-dnscrypt-proxy} (127.0.2.1)"
+            fi
+        fi
+        echo "ACTIVE: ${svr}"
+    else
+        echo "Standard DHCP / NetworkManager"
+    fi
+}
+
+status_get_mac() {
+    if [ -f "$NM_MAC_CONF" ] && grep -q "wifi.cloned-mac-address=random" "$NM_MAC_CONF" 2>/dev/null; then
+        echo "PERSISTENT (Cloned Random)"
+    else
+        echo "DEFAULT (Hardware MAC)"
+    fi
+}
+
+status_get_timer() {
+    if [ -f "$OPTIMIZER_TIMER" ] && systemctl is-enabled --quiet mint-optimizer.timer 2>/dev/null; then
+        echo "ACTIVE (Weekly Sun 03:00)"
+    else
+        echo "DISABLED"
+    fi
+}
+
+status_get_ipv6() {
+    local dis
+    dis=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "0")
+    if [ "$dis" -eq 1 ]; then
+        echo "BLOCKED / DISABLED"
+    else
+        echo "ENABLED"
+    fi
+}
+
+check_pending_updates() {
+    local count=0
+    if [ -x "/usr/lib/update-notifier/apt-check" ]; then
+        count=$(/usr/lib/update-notifier/apt-check 2>/dev/null | cut -d';' -f1 || echo 0)
+    else
+        count=$(apt-get -s -u upgrade 2>/dev/null | grep -E '^[0-9]+ upgraded' | awk '{print $1}' || echo 0)
+    fi
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    echo "$count"
+}
+
+check_cleanable_cache() {
+    local total_kb=0
+    local apt_kb=0
+    if [ -d "/var/cache/apt/archives" ]; then
+        apt_kb=$(du -sk /var/cache/apt/archives 2>/dev/null | awk '{print $1}' || echo 0)
+    fi
+    [[ "$apt_kb" =~ ^[0-9]+$ ]] || apt_kb=0
+    total_kb=$(( total_kb + apt_kb ))
+
+    local j_kb=0
+    if command -v journalctl &>/dev/null; then
+        local j_str
+        j_str=$(journalctl --disk-usage 2>/dev/null || echo "")
+        if [[ "$j_str" =~ ([0-9]+(\.[0-9]+)?)([MG]) ]]; then
+            local val="${BASH_REMATCH[1]}"
+            local unit="${BASH_REMATCH[3]}"
+            if [ "$unit" = "M" ]; then
+                j_kb=$(awk "BEGIN {print int($val * 1024)}")
+            elif [ "$unit" = "G" ]; then
+                j_kb=$(awk "BEGIN {print int($val * 1048576)}")
+            fi
+        fi
+    fi
+    [[ "$j_kb" =~ ^[0-9]+$ ]] || j_kb=0
+    if [ "$j_kb" -gt 102400 ]; then
+        total_kb=$(( total_kb + (j_kb - 102400) ))
+    fi
+    echo "$total_kb"
+}
+
+apply_preset() {
+    local preset="${1:-}"
+    check_root "preset" "apply" "$preset"
+
+    case "$preset" in
+        desk|docked)
+            log_info "Applying 'Desk / Docked' profile preset..."
+            install_battery_service 60
+            apply_system_tuning
+            mkdir -p "$(dirname "$PROFILE_CONF")"
+            echo "PROFILE=desk" > "$PROFILE_CONF"
+            log_success "Profile preset 'Desk / Docked' applied (60% battery threshold, BBR, ZRAM)."
+            ;;
+        balanced|daily|default)
+            log_info "Applying 'Balanced Daily' profile preset..."
+            install_battery_service 80
+            apply_system_tuning
+            mkdir -p "$(dirname "$PROFILE_CONF")"
+            echo "PROFILE=balanced" > "$PROFILE_CONF"
+            log_success "Profile preset 'Balanced Daily' applied (80% battery threshold, BBR, ZRAM)."
+            ;;
+        travel|mobile|full)
+            log_info "Applying 'Travel / Mobile' profile preset..."
+            set_battery_threshold 100
+            mkdir -p "$(dirname "$PROFILE_CONF")"
+            echo "PROFILE=travel" > "$PROFILE_CONF"
+            log_success "Profile preset 'Travel / Mobile' applied (100% full capacity for portable travel)."
+            ;;
+        custom|reset)
+            rm -f "$PROFILE_CONF"
+            log_info "Profile preset reset to Custom."
+            ;;
+        *)
+            log_err "Unknown profile preset: '$preset'"
+            echo "Available presets: desk (60%), balanced (80%), travel (100%), custom"
+            exit 1
+            ;;
+    esac
+}
+
+show_preset_status() {
+    echo -e "${CYAN}========================================================${NC}"
+    echo -e "${BOLD}               Profile Preset Status${NC}"
+    echo -e "${CYAN}========================================================${NC}"
+    local p
+    p=$(status_get_preset)
+    echo -e "Active Profile Preset : ${GREEN}${BOLD}${p}${NC}"
+    echo ""
+    echo "Available Presets:"
+    echo "  1) desk     : 60% battery limit, BBR congestion control, ZRAM compressed swap."
+    echo "                Ideal for laptops permanently or frequently on AC power."
+    echo "  2) balanced : 80% battery limit, BBR congestion control, ZRAM compressed swap."
+    echo "                Recommended default balance between battery health and mobile runtime."
+    echo "  3) travel   : 100% full charge capacity."
+    echo "                Maximum battery runtime when traveling away from outlets."
+    echo "  4) custom   : Individual subsystem settings configured independently."
+    echo ""
+    echo "To switch presets: sudo $0 preset apply <desk|balanced|travel>"
+    echo -e "${CYAN}========================================================${NC}"
+}
+
+interactive_preset_menu() {
+    clear 2>/dev/null || true
+    echo -e "${CYAN}======================================================================${NC}"
+    echo -e "${BOLD}             Laptop Linux Optimizer — Profile Presets Switcher        ${NC}"
+    echo -e "${CYAN}======================================================================${NC}"
+    echo -e "Current Active Profile: ${GREEN}${BOLD}$(status_get_preset)${NC}"
+    echo ""
+    echo -e "Select a preset mode:"
+    echo -e "  1) ${BOLD}Desk / Docked${NC}    | 60% battery limit + BBR + ZRAM (Constantly plugged in)"
+    echo -e "  2) ${BOLD}Balanced Daily${NC}   | 80% battery limit + BBR + ZRAM (Everyday longevity - Recommended)"
+    echo -e "  3) ${BOLD}Travel / Mobile${NC}  | 100% battery capacity (Maximum battery runtime on the go)"
+    echo -e "  4) ${BOLD}Custom / Reset${NC}   | Mark profile as custom"
+    echo -e "  5) Cancel / Return"
+    echo -e "${CYAN}======================================================================${NC}"
+    read -rp "Select preset [1-4, 5 to Cancel]: " pchoice
+    case "$pchoice" in
+        1|desk) apply_preset "desk" ;;
+        2|balanced) apply_preset "balanced" ;;
+        3|travel) apply_preset "travel" ;;
+        4|custom) apply_preset "custom" ;;
+        *) log_info "Preset switch cancelled." ;;
+    esac
+}
+
+show_maintenance_advisory() {
+    local updates cleanable_kb
+    updates=$(check_pending_updates)
+    cleanable_kb=$(check_cleanable_cache)
+    echo -e "${CYAN}========================================================${NC}"
+    echo -e "${BOLD}           System Updates & Housekeeping Advisory${NC}"
+    echo -e "${CYAN}========================================================${NC}"
+    if [ "$updates" -gt 0 ]; then
+        echo -e "Pending Package Updates : ${YELLOW}${BOLD}${updates} packages available${NC}"
+    else
+        echo -e "Pending Package Updates : ${GREEN}All packages up to date${NC}"
+    fi
+
+    if [ "$cleanable_kb" -gt 50000 ]; then
+        echo -e "Cleanable Caches & Logs : ${YELLOW}${BOLD}$(format_kb "$cleanable_kb") reclaimable${NC}"
+    else
+        echo -e "Cleanable Caches & Logs : ${GREEN}System storage is lean (~$(format_kb "$cleanable_kb"))${NC}"
+    fi
+    echo -e "${CYAN}========================================================${NC}"
+}
+
+# ==============================================================================
+# Master Interactive Terminal User Interface (TUI Dashboard)
+# ==============================================================================
+
+FIRST_PROMPT_DONE=0
+
+run_menu_action() {
+    set +e
+    "$@"
+    local rc=$?
+    set -e
+    if [ $rc -ne 0 ]; then
+        echo ""
+        log_warn "Action finished with exit code $rc."
+    fi
+    echo ""
+    read -rp "Press Enter to return to Dashboard..." _ || true
+}
+
+show_system_summary() {
+    local cur_preset cur_bat cur_zram cur_bbr cur_dns cur_mac cur_timer cur_ipv6
+    cur_preset=$(status_get_preset)
+    cur_bat=$(status_get_battery)
+    cur_zram=$(status_get_zram)
+    cur_bbr=$(status_get_bbr)
+    cur_dns=$(status_get_dns)
+    cur_mac=$(status_get_mac)
+    cur_timer=$(status_get_timer)
+    cur_ipv6=$(status_get_ipv6)
+
+    local updates="${1:-}"
+    local cleanable_kb="${2:-}"
+    [ -z "$updates" ] && updates=$(check_pending_updates)
+    [ -z "$cleanable_kb" ] && cleanable_kb=$(check_cleanable_cache)
+
+    echo -e "${CYAN}================================================================================${NC}"
+    echo -e "  ${BOLD}${GREEN}⚡ Laptop Linux Optimizer — Comprehensive System Status Summary${NC}"
+    echo -e "${CYAN}================================================================================${NC}"
+    echo -e "  ${BOLD}[ HARDWARE & PERFORMANCE ]${NC}"
+    echo -e "  • Active Profile Preset: ${GREEN}${BOLD}${cur_preset}${NC}"
+    echo -e "  • Battery Diagnostics  : ${CYAN}${cur_bat}${NC}"
+    echo -e "  • ZRAM Compressed Swap : ${GREEN}${cur_zram}${NC}"
+    echo -e "  • TCP Congestion (BBR) : ${GREEN}${cur_bbr}${NC}"
+    echo ""
+    echo -e "  ${BOLD}[ SECURITY & NETWORK PRIVACY ]${NC}"
+    echo -e "  • Encrypted DNS Status : ${BLUE}${cur_dns}${NC}"
+    echo -e "  • Network MAC Address  : ${MAGENTA}${cur_mac}${NC}"
+    echo -e "  • IPv6 Protocol State  : ${cur_ipv6}"
+    echo -e "  • Automated Background : ${cur_timer}"
+    echo ""
+    echo -e "  ${BOLD}[ MAINTENANCE & STORAGE ADVISORY ]${NC}"
+    if [ "$updates" -gt 0 ]; then
+        echo -e "  • Package Updates      : ${YELLOW}${BOLD}${updates} package update(s) ready to install${NC}"
+    else
+        echo -e "  • Package Updates      : ${GREEN}All packages up to date${NC}"
+    fi
+    if [ "$cleanable_kb" -gt 50000 ]; then
+        echo -e "  • Cleanable Storage    : ${YELLOW}${BOLD}~$(format_kb "$cleanable_kb")${NC} in cleanable caches & logs"
+    else
+        echo -e "  • Cleanable Storage    : ${GREEN}System storage is lean (~$(format_kb "$cleanable_kb"))${NC}"
+    fi
+    echo -e "${CYAN}================================================================================${NC}"
+}
+
+show_whiptail_tui() {
+    local tui_cmd=""
+    if command -v whiptail &>/dev/null; then
+        tui_cmd="whiptail"
+    elif command -v dialog &>/dev/null; then
+        tui_cmd="dialog"
+    else
+        log_warn "Neither whiptail nor dialog found; falling back to ANSI dashboard."
+        return 1
+    fi
+
     while true; do
-        clear 2>/dev/null || true
-        echo -e "${CYAN}======================================================================${NC}"
-        echo -e "${BOLD}       Laptop Linux Optimizer & System Control Center (v${VERSION})${NC}"
-        echo -e "${CYAN}======================================================================${NC}"
-        echo -e "${GREEN}${BOLD}  1) 🚀 Guided Laptop Optimization Wizard (Recommended)${NC}"
-        echo -e "     Step-by-step: Updates -> Battery -> DNS -> ZRAM & BBR -> Privacy"
-        echo ""
-        echo -e "${CYAN}[ 1. Maintenance & Package Updates ]${NC}"
-        echo -e "  2) ${BOLD}Update All Packages & Sweep Clean${NC}     | APT dist-upgrade + Flatpak + orphan clean"
-        echo -e "  3) ${BOLD}System Housekeeping & Optimization${NC}    | Clean caches, journals, and temp"
-        echo ""
-        echo -e "${CYAN}[ 2. Hardware Battery Management ]${NC}"
-        echo -e "  4) ${BOLD}Battery Diagnostics & Health Report${NC}   | Capacity, cycle count & charge limit status"
-        echo -e "  5) ${BOLD}Configure Battery Charge Limiter${NC}      | Set threshold (60% / 80% / 100%) & persistence"
-        echo ""
-        echo -e "${CYAN}[ 3. Network & Encrypted DNS ]${NC}"
-        echo -e "  6) ${BOLD}Encrypted DNS Manager (DoH/Relay/Tor)${NC}| Switch profiles (Cloudflare, Quad9, AdGuard)"
-        echo -e "  7) ${BOLD}Check Active DNS Resolvers${NC}            | View active nameservers & proxy state"
-        echo -e "  8) ${BOLD}Randomize Network MAC Addresses${NC}       | Instantaneous spoofing + auto-randomization"
-        echo -e "  9) ${BOLD}Inspect MAC & Network Interfaces${NC}      | Check active vs permanent hardware MACs"
-        echo -e " 10) ${BOLD}IPv6 Protocol Control (Enable/Disable)${NC} | Toggle IPv6 network stack system-wide"
-        echo ""
-        echo -e "${CYAN}[ 4. Performance Tuning & RAM ]${NC}"
-        echo -e " 11) ${BOLD}Performance & Privacy Tuning Menu${NC}     | BBR, ZRAM, Swappiness 100, DHCP privacy"
-        echo ""
-        echo -e "${CYAN}[ 5. Privacy Scrubbing (Requires App Restart) ]${NC}"
-        echo -e " 12) ${BOLD}Privacy & Activity Cache Scrub${NC}        | Clear browser caches, recent files, DNS logs"
-        echo ""
-        echo -e "${CYAN}[ 6. Automation & Master Tasks ]${NC}"
-        echo -e " 13) ${BOLD}Manage Weekly Maintenance Timer${NC}       | Status, install or remove automated schedule"
-        echo -e " 14) ${BOLD}TOTAL MASTER SUITE${NC}                     | Update + Housekeeping + Privacy + MAC"
-        echo ""
-        echo -e "  0) ${BOLD}Exit${NC}"
-        echo -e "${CYAN}======================================================================${NC}"
-        read -rp "Select an option [0-14]: " choice
+        local p_info b_info z_info bbr_info
+        p_info=$(status_get_preset)
+        b_info=$(status_get_battery)
+        z_info=$(status_get_zram)
+        bbr_info=$(status_get_bbr)
+
+        local choice
+        choice=$($tui_cmd --title "Laptop Linux Optimizer & Admin Suite (v$VERSION)" \
+            --backtitle "Preset: $p_info | Battery: $b_info | ZRAM: $z_info | CC: $bbr_info" \
+            --menu "Select a subsystem or management action below:" 22 78 13 \
+            "P"  "Switch Profile Preset (Desk / Balanced / Travel)" \
+            "1"  "Guided Laptop Optimization Wizard (5-Step Setup)" \
+            "2"  "Update All Packages & Sweep Clean (APT + Flatpak)" \
+            "3"  "System Housekeeping (Caches, journals, temp)" \
+            "4"  "Battery Diagnostics & Charge Limiter Configuration" \
+            "5"  "Encrypted DNS Manager (DoH / Relays / Tor)" \
+            "6"  "Network MAC Randomization & Spoofing" \
+            "7"  "Performance & Kernel Tuning (BBR, ZRAM, Swappiness)" \
+            "8"  "Privacy & Anti-Tracking Activity Scrub" \
+            "9"  "Automated Weekly Maintenance Timer" \
+            "10" "Toggle IPv6 Protocol (Enable / Disable)" \
+            "11" "Complete Master Suite (All-In-One)" \
+            "A"  "Switch to ANSI Terminal Dashboard" \
+            3>&1 1>&2 2>&3 || echo "Q")
 
         case "$choice" in
-            1)
-                run_guided_wizard
-                read -rp "Press Enter to continue..."
+            P) interactive_preset_menu ;;
+            1) run_guided_wizard ;;
+            2) update_and_clean; read -rp "Press Enter..." ;;
+            3) run_optimizer; read -rp "Press Enter..." ;;
+            4) show_battery_status; read -rp "Press Enter..." ;;
+            5) interactive_dns_menu ;;
+            6) show_mac_status; read -rp "Press Enter..." ;;
+            7) show_tuning_status; read -rp "Press Enter..." ;;
+            8) clean_privacy "privacy"; read -rp "Press Enter..." ;;
+            9) show_timer_status; read -rp "Press Enter..." ;;
+            10)
+                local cur_st="ENABLED"
+                [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" -eq 1 ] && cur_st="DISABLED"
+                local next_st="DISABLE"
+                [ "$cur_st" = "DISABLED" ] && next_st="ENABLE"
+                if $tui_cmd --title "IPv6 Protocol Toggle" --yesno "Current IPv6 State: $cur_st\n\nWould you like to toggle IPv6 ($next_st system-wide)?" 10 65; then
+                    toggle_ipv6
+                    read -rp "Press Enter to continue..." _
+                fi
+                ;;
+            11) run_complete_suite; read -rp "Press Enter..." ;;
+            A|Q|"") break ;;
+        esac
+    done
+}
+
+show_tui_dashboard() {
+    # Check for pending updates and cleanable caches
+    local updates cleanable_kb
+    updates=$(check_pending_updates)
+    cleanable_kb=$(check_cleanable_cache)
+
+    # Initial display on first interactive launch: complete summary of all statuses
+    if [ "$FIRST_PROMPT_DONE" -eq 0 ]; then
+        FIRST_PROMPT_DONE=1
+        clear 2>/dev/null || true
+        show_system_summary "$updates" "$cleanable_kb"
+
+        if [ "$updates" -gt 0 ] || [ "$cleanable_kb" -gt 50000 ]; then
+            echo ""
+            echo -e "  ${YELLOW}${BOLD}🔔 Notice: Pending maintenance actions detected.${NC}"
+            read -rp "  Run package updates and cache cleanups now? [y/N/Skip]: " maint_ans
+            if [[ "$maint_ans" =~ ^[Yy]$ ]]; then
+                set +e
+                update_and_clean
+                run_optimizer
+                set -e
+                echo ""
+                read -rp "Press Enter to proceed to Master Dashboard..." _ || true
+                updates=$(check_pending_updates)
+                cleanable_kb=$(check_cleanable_cache)
+            fi
+        else
+            echo ""
+            read -rp "Press Enter to proceed to Master Dashboard..." _ || true
+        fi
+    fi
+
+    while true; do
+        clear 2>/dev/null || true
+
+        # Gather real-time status metrics
+        local cur_preset cur_bat cur_zram cur_bbr cur_dns cur_mac cur_timer cur_ipv6
+        cur_preset=$(status_get_preset)
+        cur_bat=$(status_get_battery)
+        cur_zram=$(status_get_zram)
+        cur_bbr=$(status_get_bbr)
+        cur_dns=$(status_get_dns)
+        cur_mac=$(status_get_mac)
+        cur_timer=$(status_get_timer)
+        cur_ipv6=$(status_get_ipv6)
+
+echo -e "${CYAN}================================================================================${NC}"
+        echo -e "  ${BOLD}${GREEN}⚡ Laptop Linux Optimizer & System Control Center (v${VERSION})${NC}"
+        echo -e "${CYAN}================================================================================${NC}"
+        echo -e "  ${BOLD}SYSTEM TELEMETRY & HARDWARE STATUS${NC}"
+        echo -e "  Active Preset   : ${GREEN}${BOLD}${cur_preset}${NC}"
+        echo -e "  Battery Limit   : ${CYAN}${cur_bat}${NC}"
+        echo -e "  ZRAM Swap       : ${GREEN}${cur_zram}${NC}"
+        echo -e "  TCP CC (BBR)    : ${GREEN}${cur_bbr}${NC}"
+        echo -e "  Encrypted DNS   : ${BLUE}${cur_dns}${NC}"
+        echo -e "  MAC Address     : ${MAGENTA}${cur_mac}${NC}"
+        echo -e "  Weekly Timer    : ${cur_timer}  |  IPv6: ${cur_ipv6}"
+        echo -e "${CYAN}--------------------------------------------------------------------------------${NC}"
+
+        # Display advisory banner if updates or cleanups pending
+        if [ "$updates" -gt 0 ] || [ "$cleanable_kb" -gt 50000 ]; then
+            echo -e "  ${YELLOW}${BOLD}🔔 NOTIFICATIONS & ADVISORY:${NC}"
+            if [ "$updates" -gt 0 ]; then
+                echo -e "  ${YELLOW}●${NC} ${BOLD}$updates${NC} package update(s) available.   [Press ${BOLD}U${NC} to Update Now]"
+            fi
+            if [ "$cleanable_kb" -gt 50000 ]; then
+                echo -e "  ${YELLOW}●${NC} ~${BOLD}$(format_kb "$cleanable_kb")${NC} cleanable caches.         [Press ${BOLD}C${NC} to Clean Now]"
+            fi
+            echo -e "${CYAN}--------------------------------------------------------------------------------${NC}"
+        fi
+
+        echo -e "  ${BOLD}[ PROFILE PRESETS ]${NC}"
+        echo -e "   ${BOLD}P)${NC} ${BOLD}Switch Profile Preset${NC}  (Desk: 60% | Balanced: 80% | Travel: 100%)"
+        echo -e ""
+        echo -e "  ${BOLD}[ MAINTENANCE & UPDATES ]${NC}"
+        echo -e "   ${BOLD}1)${NC} 🚀 Guided Laptop Optimization Wizard   ${DIM}(Full 5-step interactive setup)${NC}"
+        echo -e "   ${BOLD}2)${NC} Update Packages & Sweep Clean         ${DIM}(APT dist-upgrade + Flatpak)${NC}"
+        echo -e "   ${BOLD}3)${NC} System Housekeeping & Optimization    ${DIM}(Journals, APT, Temp caches)${NC}"
+        echo -e "   ${BOLD}4)${NC} Complete Master Suite                 ${DIM}(Update + Clean + Privacy + MAC)${NC}"
+        echo -e ""
+        echo -e "  ${BOLD}[ HARDWARE & NETWORK CONTROL ]${NC}"
+        echo -e "   ${BOLD}5)${NC} Battery Diagnostics & Charge Limiter Configuration"
+        echo -e "   ${BOLD}6)${NC} Encrypted DNS Manager (DoH / Relays / Tor)"
+        local ipv6_lbl="ENABLED"
+        [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" -eq 1 ] && ipv6_lbl="DISABLED"
+        echo -e "   ${BOLD}7)${NC} Network MAC Randomization & Inspection"
+        echo -e "   ${BOLD}8)${NC} Toggle IPv6 Protocol               ${DIM}(State: [${ipv6_lbl}])${NC}"
+        echo -e ""
+        echo -e "  ${BOLD}[ PERFORMANCE & PRIVACY ]${NC}"
+        echo -e "   ${BOLD}9)${NC} Performance & Kernel Tuning (BBR, ZRAM, Swappiness 100)"
+        echo -e "  ${BOLD}10)${NC} Privacy & Anti-Tracking Scrub (Browser caches, recent docs)"
+        echo -e "  ${BOLD}11)${NC} Automated Weekly Maintenance Timer (Systemd)"
+        echo -e ""
+        echo -e "  ${BOLD}D)${NC} Dialog/Whiptail Mode   ${BOLD}R)${NC} Refresh Telemetry   ${BOLD}0/Q)${NC} Exit"
+        echo -e "${CYAN}================================================================================${NC}"
+        read -rp "Select an option [0-11, P, U, C, D, R, Q]: " opt
+
+        case "$opt" in
+            [Pp]|preset)
+                run_menu_action interactive_preset_menu
+                ;;
+            [Uu]|update)
+                run_menu_action update_and_clean
+                updates=$(check_pending_updates)
+                cleanable_kb=$(check_cleanable_cache)
+                ;;
+            [Cc]|clean)
+                run_menu_action run_optimizer
+                cleanable_kb=$(check_cleanable_cache)
+                ;;
+            [Dd]|dialog|whiptail)
+                show_whiptail_tui || true
+                ;;
+            [Rr]|refresh)
+                updates=$(check_pending_updates)
+                cleanable_kb=$(check_cleanable_cache)
+                ;;
+            1|wizard)
+                run_menu_action run_guided_wizard
                 ;;
             2)
-                update_and_clean
-                read -rp "Press Enter to continue..."
+                run_menu_action update_and_clean
+                updates=$(check_pending_updates)
+                cleanable_kb=$(check_cleanable_cache)
                 ;;
             3)
-                run_optimizer
-                read -rp "Press Enter to continue..."
+                run_menu_action run_optimizer
+                cleanable_kb=$(check_cleanable_cache)
                 ;;
             4)
-                show_battery_status
-                read -rp "Press Enter to continue..."
+                read -rp "Run complete master suite (Update + Clean + Privacy + MAC)? [y/N]: " conf_suite
+                if [[ "$conf_suite" =~ ^[Yy]$ ]]; then
+                    run_menu_action run_complete_suite
+                    updates=$(check_pending_updates)
+                    cleanable_kb=$(check_cleanable_cache)
+                fi
                 ;;
-            5)
+            5|battery)
                 echo ""
-                echo "Preset Modes:"
-                echo "  60  - Maximum Lifespan (constantly plugged into AC)"
-                echo "  80  - Balanced (recommended everyday longevity)"
-                echo "  100 - Full Capacity (travel / maximum portable runtime)"
-                read -rp "Enter target threshold percentage [20-100, default: 80]: " tval
-                tval="${tval:-80}"
-                if [[ "$tval" =~ ^[0-9]+$ ]] && [ "$tval" -ge 20 ] && [ "$tval" -le 100 ]; then
-                    read -rp "Enable persistence across reboots & sleep? [Y/n]: " pyn
-                    if [[ "$pyn" =~ ^[Nn] ]]; then
-                        set_battery_threshold "$tval"
-                    else
-                        install_battery_service "$tval"
-                    fi
-                else
-                    log_err "Invalid threshold."
-                fi
-                read -rp "Press Enter to continue..."
+                show_battery_status
+                echo ""
+                echo "1) Set charge threshold (e.g. 60, 80, 100)"
+                echo "2) Install persistent limiter service"
+                echo "3) Uninstall limiter service (restore 100%)"
+                echo "4) Return"
+                read -rp "Option [1-4]: " bopt
+                case "$bopt" in
+                    1)
+                        read -rp "Enter target percentage [20-100, default 80]: " bval
+                        bval="${bval:-80}"
+                        run_menu_action set_battery_threshold "$bval"
+                        ;;
+                    2)
+                        read -rp "Enter target persistent limit [20-100, default 80]: " bval
+                        bval="${bval:-80}"
+                        run_menu_action install_battery_service "$bval"
+                        ;;
+                    3)
+                        run_menu_action uninstall_battery_service
+                        ;;
+                esac
                 ;;
-            6)
-                interactive_dns_menu
-                read -rp "Press Enter to continue..."
+            6|dns)
+                run_menu_action interactive_dns_menu
                 ;;
-            7)
-                show_dns_status
-                read -rp "Press Enter to continue..."
-                ;;
-            8)
-                read -rp "Randomize network MAC addresses now? [y/N]: " conf_mac
-                if [[ "$conf_mac" =~ ^[Yy]$ ]]; then
-                    randomize_mac
-                else
-                    log_info "MAC randomization cancelled."
-                fi
-                read -rp "Press Enter to continue..."
-                ;;
-            9)
+            7|mac)
+                echo ""
                 show_mac_status
-                read -rp "Press Enter to continue..."
+                echo ""
+                echo "1) Randomize MAC addresses now (instant spoof)"
+                echo "2) Enable persistent NetworkManager auto-randomization"
+                echo "3) Disable persistent auto-randomization"
+                echo "4) Return"
+                read -rp "Option [1-4]: " mopt
+                case "$mopt" in
+                    1) run_menu_action randomize_mac ;;
+                    2) run_menu_action enable_mac_randomization ;;
+                    3) run_menu_action disable_mac_randomization ;;
+                esac
                 ;;
-            10)
+            8|ipv6)
                 echo ""
                 show_ipv6_status
                 echo ""
-                echo "1) Disable IPv6 (Block IPv6 traffic & VPN/WebRTC leaks)"
-                echo "2) Enable IPv6"
-                echo "3) Return"
-                read -rp "Option: " ipv6_opt
-                case "$ipv6_opt" in
-                    1) disable_ipv6 ;;
-                    2) enable_ipv6 ;;
+                local cur_st="ENABLED"
+                [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" -eq 1 ] && cur_st="DISABLED"
+                local next_action="Disable IPv6 (Block leaks & IPv6 traffic)"
+                [ "$cur_st" = "DISABLED" ] && next_action="Enable IPv6 system-wide"
+                echo "1) Toggle IPv6 ($next_action)"
+                echo "2) Return to Dashboard"
+                read -rp "Option [1-2, default 1]: " iopt
+                iopt="${iopt:-1}"
+                case "$iopt" in
+                    1) run_menu_action toggle_ipv6 ;;
                 esac
-                read -rp "Press Enter to continue..."
                 ;;
-            11)
+            9|tune)
                 echo ""
                 show_tuning_status
                 echo ""
-                echo "1) Apply Performance & Privacy Tunings (BBR, ZRAM, Swappiness 100, DHCP privacy, fast boot)"
+                echo "1) Apply Performance & Privacy Tunings (BBR, ZRAM, Swappiness 100, DHCP privacy)"
                 echo "2) Revert Tunings to Standard Mint Defaults"
                 echo "3) Return"
-                read -rp "Option: " tune_opt
-                case "$tune_opt" in
-                    1) apply_system_tuning ;;
-                    2) revert_system_tuning ;;
+                read -rp "Option [1-3]: " topt
+                case "$topt" in
+                    1) run_menu_action apply_system_tuning ;;
+                    2) run_menu_action revert_system_tuning ;;
                 esac
-                read -rp "Press Enter to continue..."
                 ;;
-            12)
+            10|privacy)
                 read -rp "Run privacy and activity scrub now? [y/N]: " conf_priv
                 if [[ "$conf_priv" =~ ^[Yy]$ ]]; then
-                    clean_privacy "privacy"
-                else
-                    log_info "Privacy scrub cancelled."
+                    run_menu_action clean_privacy "privacy"
                 fi
-                read -rp "Press Enter to continue..."
                 ;;
-            13)
+            11|timer)
                 echo ""
                 show_timer_status
                 echo ""
-                echo "1) Install / Enable Weekly Timer"
+                echo "1) Install / Enable Weekly Automated Timer"
                 echo "2) Uninstall / Disable Weekly Timer"
                 echo "3) Return"
-                read -rp "Option: " topt
-                case "$topt" in
-                    1) install_weekly_timer ;;
-                    2) uninstall_weekly_timer ;;
+                read -rp "Option [1-3]: " tmopt
+                case "$tmopt" in
+                    1) run_menu_action install_weekly_timer ;;
+                    2) run_menu_action uninstall_weekly_timer ;;
                 esac
-                read -rp "Press Enter to continue..."
                 ;;
-            14)
-                read -rp "Run total master suite (Update + Housekeep + Privacy + MAC)? [y/N]: " conf_suite
-                if [[ "$conf_suite" =~ ^[Yy]$ ]]; then
-                    run_complete_suite
-                else
-                    log_info "Master suite cancelled."
-                fi
-                read -rp "Press Enter to continue..."
-                ;;
-            0|q|exit)
+            0|[Qq]|exit|quit)
                 echo "Goodbye!"
                 exit 0
                 ;;
@@ -1971,6 +2464,11 @@ show_interactive_menu() {
                 ;;
         esac
     done
+}
+
+show_interactive_menu() {
+    # Option 1: Guided Laptop Optimization Wizard (Recommended)
+    show_tui_dashboard "$@"
 }
 
 show_help() {
@@ -1999,10 +2497,23 @@ show_help() {
     echo "    enable                  Enable persistent auto-randomization in NetworkManager"
     echo "    disable                 Disable persistent auto-randomization"
     echo ""
-    echo "  ipv6                      IPv6 network protocol control"
+    echo "  ipv6                      IPv6 network protocol control & toggle"
     echo "    status                  Display current IPv6 status and active addresses"
-    echo "    disable, off            Disable IPv6 system-wide (prevents VPN/WebRTC leaks)"
+    echo "    toggle                  Toggle IPv6 on/off instantly"
+    echo "    disable, off            Disable IPv6 system-wide (preserving loopback ::1)"
     echo "    enable, on              Enable IPv6 system-wide"
+    echo ""
+    echo "  preset, profile           Switch or view laptop performance/battery profile presets"
+    echo "    status                  Display active profile preset & hardware status"
+    echo "    apply <desk|balanced|travel>  Apply one-click profile preset"
+    echo "    desk                    Preset: 60% battery limit + BBR + ZRAM (AC docked)"
+    echo "    balanced                Preset: 80% battery limit + BBR + ZRAM (Daily default)"
+    echo "    travel                  Preset: 100% full capacity (Travel / mobile)"
+    echo ""
+    echo "  check, advisory           Check pending package updates and cleanable cache storage"
+    echo "  summary, status           Display comprehensive summary of all system statuses"
+    echo "  tui, dashboard, menu      Launch interactive terminal dashboard (TUI)"
+    echo "    --dialog, --whiptail    Launch in modal dialog / whiptail GUI mode"
     echo ""
     echo "  optimize, clean           Run routine housekeeping (APT, Flatpak, journals, temp)"
     echo "  update, upgrade           Update all packages (APT & Flatpak) and purge orphans/caches"
@@ -2019,7 +2530,6 @@ show_help() {
     echo "    install                 Install persistent systemd weekly timer"
     echo "    uninstall               Remove systemd weekly timer"
     echo ""
-    echo "  menu, interactive         Launch the master interactive terminal dashboard"
     echo "  version, -v, --version    Show version information"
     echo "  help, --help, -h          Show this help manual"
     echo ""
@@ -2027,7 +2537,10 @@ show_help() {
     echo "  -y, --yes, --force        Execute non-interactively without confirmation prompts"
     echo ""
     echo "Examples:"
-    echo "  $0                                # Launch master interactive menu"
+    echo "  $0                                # Launch master interactive TUI dashboard"
+    echo "  $0 preset balanced                # Switch to Balanced Daily preset (80% + BBR + ZRAM)"
+    echo "  $0 preset desk                    # Switch to AC Docked preset (60% + BBR + ZRAM)"
+    echo "  $0 check                          # Inspect pending updates & cleanable disk space"
     echo "  $0 battery status                 # Check battery health & current threshold"
     echo "  sudo $0 battery set 80            # Set charge limiter to 80%"
     echo "  sudo $0 battery install 80        # Persist 80% limit across reboots & sleep"
@@ -2048,7 +2561,7 @@ show_help() {
 
 FORCE_YES=0
 CLEAN_ARGS=()
-for arg in "${@:-}"; do
+for arg in "$@"; do
     case "$arg" in
         -y|--yes|--force)
             FORCE_YES=1
@@ -2167,6 +2680,9 @@ case "$CMD" in
             status)
                 show_ipv6_status
                 ;;
+            toggle)
+                toggle_ipv6
+                ;;
             disable|off|block)
                 disable_ipv6
                 ;;
@@ -2175,10 +2691,14 @@ case "$CMD" in
                 ;;
             *)
                 log_err "Unknown ipv6 command: '$SUB'"
-                echo "Usage: $0 ipv6 [status | disable | enable]"
+                echo "Usage: $0 ipv6 [status | toggle | disable | enable]"
                 exit 1
                 ;;
         esac
+        ;;
+
+    toggle-ipv6)
+        toggle_ipv6
         ;;
 
     disable-ipv6)
@@ -2251,12 +2771,49 @@ case "$CMD" in
         esac
         ;;
 
-    version|-v|--version)
-        echo "Laptop Linux Optimizer (mint-admin) v${VERSION}"
+    preset|profile)
+        SUB="${1:-status}"
+        shift || true
+        case "$SUB" in
+            status)
+                show_preset_status
+                ;;
+            apply|set)
+                if [ $# -lt 1 ]; then
+                    interactive_preset_menu
+                else
+                    apply_preset "$1"
+                fi
+                ;;
+            desk|balanced|travel|custom)
+                apply_preset "$SUB"
+                ;;
+            *)
+                log_err "Unknown preset command: '$SUB'"
+                echo "Usage: $0 preset [status | apply <desk|balanced|travel|custom>]"
+                exit 1
+                ;;
+        esac
         ;;
 
-    menu|interactive|dashboard)
-        show_interactive_menu
+    summary|status|report)
+        show_system_summary
+        ;;
+
+    check|advisory|notify)
+        show_maintenance_advisory
+        ;;
+
+    tui|dashboard|menu|interactive)
+        if [ "${1:-}" = "--dialog" ] || [ "${1:-}" = "--whiptail" ]; then
+            show_whiptail_tui
+        else
+            show_tui_dashboard
+        fi
+        ;;
+
+    version|-v|--version)
+        echo "Laptop Linux Optimizer (mint-admin) v${VERSION}"
         ;;
 
     help|--help|-h)

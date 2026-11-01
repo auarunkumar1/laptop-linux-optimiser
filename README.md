@@ -1,6 +1,6 @@
 # Laptop Linux Optimizer (`laptop-linux-optimiser`)
 
-[![Release](https://img.shields.io/badge/version-v0.1.1-blue.svg)](https://github.com/auarunkumar1/laptop-linux-optimiser/releases)
+[![Release](https://img.shields.io/badge/version-v0.2.0-blue.svg)](https://github.com/auarunkumar1/laptop-linux-optimiser/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20Mint%20%7C%20Ubuntu%20%7C%20Debian-lightgrey.svg)]()
 [![Shell](https://img.shields.io/badge/shell-bash%20%3E%3D%204.4-brightgreen.svg)]()
@@ -19,8 +19,9 @@
 | 🕵️ **MAC Spoofing** | **Hardware Randomization** | Generates cryptographically strong random MACs via `/dev/urandom`. Automatically detects and protects active SSH connections and default gateways from drops. Excludes virtual/container interfaces (`docker`, `br-*`, `tailscale`, `wg`). |
 | 🧹 **Privacy Scrubbing** | **Hardened Cache Purge** | Symlink-attack-immune cleanup of browser caches (Firefox, Chrome, Brave, Vivaldi), recent document histories (`recently-used.xbel`), thumbnails, trash bins, crash logs, and `dnscrypt-proxy` query logs. |
 | 📦 **Housekeeping** | **Package & System Sweep** | APT update & `dist-upgrade` with non-interactive conffile protection, Flatpak system/user runtime cleanup, systemd journal rotation/vacuuming, and residual package (`rc`) purging. |
-| ⏱️ **Automation** | **Weekly Systemd Timer** | Automated weekly background maintenance schedule executing in-place with space-safe quoting and privilege safety checks. |
-| 🖥️ **Terminal UI** | **Interactive Menu** | Rich terminal dashboard with confirmation safeguards for destructive actions, plus full CLI support for non-interactive scripting (`-y` / `--yes`). |
+| ⏱️ **Automation** | **Weekly Systemd Timer** | Automated weekly background maintenance schedule executing with root-owned binary security (`/usr/local/sbin/mint-admin`), space-safe quoting, and privilege safety checks. |
+| 🎛️ **Profile Presets** | **One-Click Presets** | Fast toggling between **Desk / AC Docked** (60% battery, BBR, ZRAM), **Balanced Daily** (80% battery, BBR, ZRAM), **Travel / Mobile** (100% capacity), and **Custom**. |
+| 🖥️ **Terminal UI** | **Interactive TUI Dashboard** | High-contrast full-screen TUI dashboard with live telemetry indicators (Battery %, ZRAM, BBR, DNS, MAC, Timer), proactive update/cleanup alerts with 1-key actions, and Whiptail GUI modal support. |
 
 ---
 
@@ -226,8 +227,9 @@ Tests cover:
 
 ## Roadmap & Planned Features
 
-- [ ] **Interactive TUI Dashboard (Next Release)**: Modern text user interface (TUI) with ncurses / Python Textual / dialog navigation, live hardware telemetry (battery watt-draw, temperature, CPU/ZRAM utilization), toggleable service switches, and mouse/arrow-key navigation.
-- [ ] **Profile Presets**: One-click switching between *Desk / AC Docked* (60% battery, performance governor), *Balanced Daily* (80% battery, BBR, ZRAM), and *Travel / Ultra-Battery Saver* (100% battery, aggressive powersave).
+- [x] **Interactive TUI Dashboard (v0.2.0)**: Modern text user interface (TUI) with interactive menus, live system telemetry (Battery limit & charging state, ZRAM utilization, BBR, DNS, MAC, Timer), proactive update/cleanup prompts, and Whiptail modal dialog support.
+- [x] **Profile Presets (v0.2.0)**: One-click switching between *Desk / AC Docked* (60% battery, BBR, ZRAM), *Balanced Daily* (80% battery, BBR, ZRAM), and *Travel / Ultra-Battery Saver* (100% battery, full mobile capacity).
+- [ ] **Hardware Telemetry Graphing**: Thermal zone sensors and real-time battery milliwatt discharge rate graph in TUI.
 
 ---
 

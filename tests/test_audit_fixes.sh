@@ -157,11 +157,12 @@ assert_true "Battery udev rule manages charge_control_end_threshold" 'grep -q "A
 assert_true "Battery service checks current threshold before writing" 'grep "charge_control_end_threshold" ./mint-admin.sh | grep -Fq "cat"'
 
 # ------------------------------------------------------------------------------
-# Test 7: Systemd unit path quoting
+# Test 7: Systemd unit path quoting & privilege escalation protection
 # ------------------------------------------------------------------------------
-echo "--- Test 7: Systemd timer ExecStart quoting ---"
-execstart_line=$(grep 'ExecStart=' ./mint-admin.sh | grep SCRIPT_PATH | head -n1)
-assert_true "ExecStart quotes the script path" 'echo "$execstart_line" | grep -q '\''ExecStart="\$SCRIPT_PATH"'\'''
+echo "--- Test 7: Systemd timer ExecStart quoting & canonical binary path ---"
+execstart_line=$(grep 'ExecStart=' ./mint-admin.sh | grep 'optimize' | head -n1)
+assert_true "ExecStart quotes the executable path" 'echo "$execstart_line" | grep -qE '\''ExecStart="(\$exec_target|\$SCRIPT_PATH|\$CANONICAL_BIN)"'\'''
+assert_true "Systemd timer installs root-owned canonical binary for /home scripts" 'grep -q "install -m 755 -o root -g root \"\$SCRIPT_PATH\" \"\$CANONICAL_BIN\"" ./mint-admin.sh'
 
 # ------------------------------------------------------------------------------
 # Test 8: Guided wizard and UI dispatcher
@@ -177,6 +178,53 @@ assert_true "Interactive menu lists Guided Wizard as Option 1" 'grep -A 12 "show
 echo "--- Test 9: Network discovery services safe default ---"
 assert_true "disable_services defaults to 0 to prevent breaking network printers" 'grep -q "local disable_services=0" ./mint-admin.sh'
 assert_true "Warning displayed before disabling discovery services" 'grep -q "Disabling avahi-daemon/cups-browsed" ./mint-admin.sh'
+
+# ------------------------------------------------------------------------------
+# Test 10: Profile Presets system
+# ------------------------------------------------------------------------------
+echo "--- Test 10: Profile Presets Architecture ---"
+assert_true "apply_preset function defined" 'grep -q "^apply_preset()" ./mint-admin.sh'
+assert_true "show_preset_status function defined" 'grep -q "^show_preset_status()" ./mint-admin.sh'
+assert_true "CLI help mentions preset command" './mint-admin.sh help | grep "preset" >/dev/null'
+assert_true "Preset status reports valid active profile" './mint-admin.sh preset status | grep -q "Active Profile Preset"'
+
+# ------------------------------------------------------------------------------
+# Test 11: Real-time Telemetry & Status Indicators
+# ------------------------------------------------------------------------------
+echo "--- Test 11: Real-time Telemetry & Status Indicators ---"
+assert_true "status_get_preset is defined" 'grep -q "^status_get_preset()" ./mint-admin.sh'
+assert_true "status_get_battery is defined" 'grep -q "^status_get_battery()" ./mint-admin.sh'
+assert_true "status_get_zram is defined" 'grep -q "^status_get_zram()" ./mint-admin.sh'
+assert_true "status_get_bbr is defined" 'grep -q "^status_get_bbr()" ./mint-admin.sh'
+assert_true "status_get_dns is defined" 'grep -q "^status_get_dns()" ./mint-admin.sh'
+assert_true "status_get_mac is defined" 'grep -q "^status_get_mac()" ./mint-admin.sh'
+
+# ------------------------------------------------------------------------------
+# Test 12: clean_user_cache symlink protection
+# ------------------------------------------------------------------------------
+echo "--- Test 12: Stale thumbnail cache symlink protection ---"
+assert_true "clean_user_cache checks for symlinks on user homes" 'grep -A 8 "^clean_user_cache()" ./mint-admin.sh | grep -q "\[ -L \"\$h\" \] && continue"'
+assert_true "clean_user_cache checks for thumbnail symlinks" 'grep -A 10 "^clean_user_cache()" ./mint-admin.sh | grep -q "\[ ! -L \"\$h/\.cache/thumbnails\" \]"'
+
+# ------------------------------------------------------------------------------
+# Test 13: Interactive TUI Dashboard & Whiptail fallback
+# ------------------------------------------------------------------------------
+echo "--- Test 13: Interactive TUI Dashboard, Dialog Support & First-Run Summary ---"
+assert_true "show_tui_dashboard function is defined" 'grep -q "^show_tui_dashboard()" ./mint-admin.sh'
+assert_true "show_whiptail_tui function is defined" 'grep -q "^show_whiptail_tui()" ./mint-admin.sh'
+assert_true "show_system_summary function is defined" 'grep -q "^show_system_summary()" ./mint-admin.sh'
+assert_true "Advisory prompt function is defined" 'grep -q "^show_maintenance_advisory()" ./mint-admin.sh'
+assert_true "summary CLI command produces full status report" './mint-admin.sh summary | grep "Comprehensive System Status Summary" >/dev/null'
+assert_true "First run triggers show_system_summary" 'grep -A 8 "if \[ \"\$FIRST_PROMPT_DONE\" -eq 0 \]; then" ./mint-admin.sh | grep -q "show_system_summary"'
+
+# ------------------------------------------------------------------------------
+# Test 14: IPv6 Protocol Control & Toggle
+# ------------------------------------------------------------------------------
+echo "--- Test 14: IPv6 Protocol Control & Toggle ---"
+assert_true "toggle_ipv6 function is defined" 'grep -q "^toggle_ipv6()" ./mint-admin.sh'
+assert_true "disable_ipv6 function is defined" 'grep -q "^disable_ipv6()" ./mint-admin.sh'
+assert_true "enable_ipv6 function is defined" 'grep -q "^enable_ipv6()" ./mint-admin.sh'
+assert_true "CLI help documents ipv6 toggle" './mint-admin.sh help | grep "toggle" >/dev/null'
 
 echo "=========================================================="
 if [ "$FAILED" -eq 0 ]; then
