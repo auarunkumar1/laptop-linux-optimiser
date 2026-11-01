@@ -1,6 +1,6 @@
 # Laptop Linux Optimizer (`laptop-linux-optimiser`)
 
-[![Release](https://img.shields.io/badge/version-v0.1.0-blue.svg)](https://github.com/auarunkumar1/laptop-linux-optimiser/releases)
+[![Release](https://img.shields.io/badge/version-v0.1.1-blue.svg)](https://github.com/auarunkumar1/laptop-linux-optimiser/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20Mint%20%7C%20Ubuntu%20%7C%20Debian-lightgrey.svg)]()
 [![Shell](https://img.shields.io/badge/shell-bash%20%3E%3D%204.4-brightgreen.svg)]()
@@ -221,6 +221,13 @@ Tests cover:
 - Non-TTY stdin handling and usage display
 - Battery udev rule format and event comparison
 - Systemd timer `ExecStart` path quoting
+
+---
+
+## Roadmap & Planned Features
+
+- [ ] **Interactive TUI Dashboard (Next Release)**: Modern text user interface (TUI) with ncurses / Python Textual / dialog navigation, live hardware telemetry (battery watt-draw, temperature, CPU/ZRAM utilization), toggleable service switches, and mouse/arrow-key navigation.
+- [ ] **Profile Presets**: One-click switching between *Desk / AC Docked* (60% battery, performance governor), *Balanced Daily* (80% battery, BBR, ZRAM), and *Travel / Ultra-Battery Saver* (100% battery, aggressive powersave).
 
 ---
 

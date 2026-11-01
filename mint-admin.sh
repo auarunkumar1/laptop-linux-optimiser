@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Laptop Linux Optimizer & Master Administration Suite (mint-admin)
-# Version: 0.1.0
+# Version: 0.1.1
 #
 # Unified Laptop Optimization & Hardening Tool:
 #   1. Battery Diagnostics & Persistent Charge Limiter (ASUS & Generic BAT*)
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 SCRIPT_PATH="$(realpath "$0")"
 
 # Colors & Formatting
@@ -33,7 +33,8 @@ NC='\e[0m'
 # File & Configuration Paths
 BATTERY_CONF="/etc/asus-battery-limit.conf"
 BATTERY_SERVICE="/etc/systemd/system/asus-battery-limit.service"
-BATTERY_SLEEP_HOOK="/lib/systemd/system-sleep/asus-battery-limit.sh"
+BATTERY_SLEEP_HOOK="/usr/lib/systemd/system-sleep/asus-battery-limit.sh"
+[ ! -d "/usr/lib/systemd/system-sleep" ] && [ -d "/lib/systemd/system-sleep" ] && BATTERY_SLEEP_HOOK="/lib/systemd/system-sleep/asus-battery-limit.sh"
 BATTERY_UDEV_RULE="/etc/udev/rules.d/99-asus-battery-charge-limit.rules"
 
 DNS_CONFIG="/etc/dnscrypt-proxy/dnscrypt-proxy.toml"
@@ -211,7 +212,8 @@ show_battery_status() {
     if [ -f "$BATTERY_SERVICE" ] && systemctl is-enabled --quiet asus-battery-limit.service 2>/dev/null; then
         echo -e "Persistence      : ${GREEN}ENABLED${NC} (active across reboots, sleep & AC events)"
         [ -f "$BATTERY_CONF" ] && echo "Saved Setting    : $(cat "$BATTERY_CONF")"
-        [ -f "$BATTERY_UDEV_RULE" ] && echo "AC Plug Watcher  : udev rule active (prevents AC-plug reset)"
+        [ -f "$BATTERY_UDEV_RULE" ] && echo "AC / BAT Watcher : udev rule active (prevents AC & device resets)"
+        [ -f "$BATTERY_SLEEP_HOOK" ] && echo "Sleep/Wake Watch : system-sleep hook active (prevents resume reset)"
     else
         echo -e "Persistence      : ${YELLOW}DISABLED${NC} (hardware threshold resets to 100% on reboot)"
         echo "                   (Run 'sudo $0 battery install <limit>' to persist)"
@@ -243,6 +245,23 @@ set_battery_threshold() {
     echo "THRESHOLD=$val" > "$BATTERY_CONF"
     chmod 644 "$BATTERY_CONF"
 
+    # Synchronize persistent service and udev rule if already installed
+    if [ -f "$BATTERY_UDEV_RULE" ]; then
+        cat << EOF > "$BATTERY_UDEV_RULE"
+# 1. Direct sysfs attribute assignment via udev on battery add/change
+SUBSYSTEM=="power_supply", KERNEL=="BAT[0-9]*", ATTR{charge_control_end_threshold}="$val"
+SUBSYSTEM=="power_supply", KERNEL=="BAT[0-9]*", TEST=="charge_control_end_threshold", IMPORT{file}="/etc/asus-battery-limit.conf", ATTR{charge_control_end_threshold}="\$env{THRESHOLD}"
+
+# 2. Re-trigger persistence service on AC power state change (Mains)
+SUBSYSTEM=="power_supply", ATTR{type}=="Mains", ACTION=="change", RUN+="/usr/bin/systemctl --no-block restart asus-battery-limit.service"
+EOF
+        udevadm control --reload-rules 2>/dev/null || true
+    fi
+
+    if [ -f "$BATTERY_SERVICE" ]; then
+        systemctl restart asus-battery-limit.service 2>/dev/null || true
+    fi
+
     log_success "Battery charge threshold set to ${val}%."
     if [ "$val" -eq 80 ]; then
         echo "  [Mode: Balanced] Excellent for everyday use and extends battery longevity."
@@ -273,44 +292,60 @@ install_battery_service() {
     echo "THRESHOLD=$val" > "$BATTERY_CONF"
     chmod 644 "$BATTERY_CONF"
 
+    # 1. Systemd Service (Triggers on boot, resume from suspend, hibernate, and hybrid-sleep)
     cat << 'EOF' > "$BATTERY_SERVICE"
 [Unit]
 Description=ASUS Battery Charge Limit Persister
-After=multi-user.target suspend.target hibernate.target hybrid-sleep.target
+DefaultDependencies=no
+After=local-fs.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
 
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c 'if [ -f /etc/asus-battery-limit.conf ]; then . /etc/asus-battery-limit.conf; else THRESHOLD=80; fi; for bat in /sys/class/power_supply/BAT*/charge_control_end_threshold; do [ -f "$bat" ] && [ "$(cat "$bat" 2>/dev/null)" != "$THRESHOLD" ] && echo "$THRESHOLD" > "$bat" 2>/dev/null || true; done'
-RemainAfterExit=yes
+RemainAfterExit=no
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
 EOF
     chmod 644 "$BATTERY_SERVICE"
 
-    if [ -d "/lib/systemd/system-sleep" ]; then
+    # 2. System Sleep Hook (Runs immediately upon wake + delayed background check to counter delayed EC firmware resets)
+    local sleep_dir
+    sleep_dir="$(dirname "$BATTERY_SLEEP_HOOK")"
+    if [ -d "$sleep_dir" ] || mkdir -p "$sleep_dir" 2>/dev/null; then
         cat << 'EOF' > "$BATTERY_SLEEP_HOOK"
 #!/bin/sh
 case "$1" in
     post)
-        if [ -f /etc/asus-battery-limit.conf ]; then
-            . /etc/asus-battery-limit.conf
-        else
-            THRESHOLD=80
-        fi
-        for bat in /sys/class/power_supply/BAT*/charge_control_end_threshold; do
-            [ -f "$bat" ] && [ "$(cat "$bat" 2>/dev/null)" != "$THRESHOLD" ] && echo "$THRESHOLD" > "$bat" 2>/dev/null || true
-        done
+        apply_thresh() {
+            if [ -f /etc/asus-battery-limit.conf ]; then
+                . /etc/asus-battery-limit.conf
+            else
+                THRESHOLD=80
+            fi
+            for bat in /sys/class/power_supply/BAT*/charge_control_end_threshold; do
+                if [ -f "$bat" ]; then
+                    [ "$(cat "$bat" 2>/dev/null)" != "$THRESHOLD" ] && echo "$THRESHOLD" > "$bat" 2>/dev/null || true
+                fi
+            done
+        }
+        apply_thresh
+        ( sleep 1; apply_thresh; sleep 2; apply_thresh ) >/dev/null 2>&1 &
         ;;
 esac
 EOF
         chmod +x "$BATTERY_SLEEP_HOOK"
     fi
 
-    # 3. Write udev rule (re-applies threshold when AC adapter is plugged/unplugged, without looping)
+    # 3. Write udev rule (direct attribute assignment on battery add/change, and AC plug watcher)
     if [ -d "/etc/udev/rules.d" ]; then
-        cat << 'EOF' > "$BATTERY_UDEV_RULE"
-SUBSYSTEM=="power_supply", ATTR{type}=="Mains", ACTION=="change", RUN+="/bin/sh -c 'if [ -f /etc/asus-battery-limit.conf ]; then . /etc/asus-battery-limit.conf; for bat in /sys/class/power_supply/BAT*/charge_control_end_threshold; do [ -f \"$$bat\" ] && [ \"$$(cat \"$$bat\" 2>/dev/null)\" != \"$$THRESHOLD\" ] && echo \"$$THRESHOLD\" > \"$$bat\" 2>/dev/null || true; done; fi'"
+        cat << EOF > "$BATTERY_UDEV_RULE"
+# 1. Direct sysfs attribute assignment via udev on battery add/change
+SUBSYSTEM=="power_supply", KERNEL=="BAT[0-9]*", ATTR{charge_control_end_threshold}="$val"
+SUBSYSTEM=="power_supply", KERNEL=="BAT[0-9]*", TEST=="charge_control_end_threshold", IMPORT{file}="/etc/asus-battery-limit.conf", ATTR{charge_control_end_threshold}="\$env{THRESHOLD}"
+
+# 2. Re-trigger persistence service on AC power state change (Mains)
+SUBSYSTEM=="power_supply", ATTR{type}=="Mains", ACTION=="change", RUN+="/usr/bin/systemctl --no-block restart asus-battery-limit.service"
 EOF
         udevadm control --reload-rules 2>/dev/null || true
     fi
@@ -329,7 +364,8 @@ uninstall_battery_service() {
     log_info "Removing persistent battery charge limiter..."
     systemctl stop asus-battery-limit.service 2>/dev/null || true
     systemctl disable asus-battery-limit.service 2>/dev/null || true
-    rm -f "$BATTERY_SERVICE" "$BATTERY_SLEEP_HOOK" "$BATTERY_CONF" "$BATTERY_UDEV_RULE"
+    rm -f "$BATTERY_SERVICE" "$BATTERY_CONF" "$BATTERY_UDEV_RULE"
+    rm -f /usr/lib/systemd/system-sleep/asus-battery-limit.sh /lib/systemd/system-sleep/asus-battery-limit.sh
     udevadm control --reload-rules 2>/dev/null || true
     systemctl daemon-reload
 

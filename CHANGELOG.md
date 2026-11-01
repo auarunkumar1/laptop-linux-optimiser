@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.1] - 2026-11-01
+
+### Fixed
+- **Battery Charge Limit Persistence**:
+  - **Wake / Resume Lifecycle**: Bound `asus-battery-limit.service` to `suspend.target`, `hibernate.target`, `hybrid-sleep.target`, and `suspend-then-hibernate.target` with `RemainAfterExit=no` to ensure automatic re-triggering upon waking from sleep or hibernation.
+  - **Firmware Race Condition**: Added an asynchronous delayed background re-check loop (at 1s and 2s) to `/usr/lib/systemd/system-sleep/asus-battery-limit.sh` to override late ASUS EC / `asus_wmi` firmware resets after resume.
+  - **Udev Rule Syntax & Scope**: Fixed udev rule to directly assign `ATTR{charge_control_end_threshold}` on `BAT*` device additions and changes, while re-triggering the persistence service non-blockingly on AC Mains adapter connect/disconnect events.
+  - **Live Setting Synchronization**: Hardened `set_battery_threshold()` to automatically reload udev rules and restart the systemd persistence service whenever an existing installation is updated.
+
+### Planned / Roadmap (Next Release)
+- **Interactive TUI Dashboard**:
+  - Full-featured Terminal User Interface (TUI) with interactive menus, live system sensor metrics, switch toggles, and keyboard navigation.
+
 ## [v0.1.0] - 2026-10-29
 
 ### Added

@@ -152,9 +152,9 @@ assert_true "Piped stdin displays usage help and exits without hanging" 'echo "$
 # Test 6: Battery udev rule syntax
 # ------------------------------------------------------------------------------
 echo "--- Test 6: Battery udev rule format ---"
-udev_rule=$(grep 'SUBSYSTEM=="power_supply"' ./mint-admin.sh | head -n1)
-assert_true "Battery udev rule triggers specifically on Mains power supply" 'echo "$udev_rule" | grep -q "ATTR{type}==\"Mains\""'
-assert_true "Battery udev rule checks current threshold before writing" 'echo "$udev_rule" | grep -Fq "cat"'
+assert_true "Battery udev rule monitors Mains power supply events" 'grep -q "ATTR{type}==\"Mains\"" ./mint-admin.sh'
+assert_true "Battery udev rule manages charge_control_end_threshold" 'grep -q "ATTR{charge_control_end_threshold}" ./mint-admin.sh'
+assert_true "Battery service checks current threshold before writing" 'grep "charge_control_end_threshold" ./mint-admin.sh | grep -Fq "cat"'
 
 # ------------------------------------------------------------------------------
 # Test 7: Systemd unit path quoting
