@@ -5,6 +5,89 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.0] - 2026-11-04
+
+### Added
+- **NetworkManager Wait-Online Delay Toggle (Fast Desktop Boot)**:
+  - Added dedicated toggle control for `NetworkManager-wait-online.service` via `mint-admin wait-online [status | toggle | enable | disable]` and `mint-admin tune wait-online`.
+  - Disabling removes ~7s delay on desktop boot time without affecting graphical session initialization.
+  - Added live status pill (`[✓ FAST BOOT (Disabled)]` / `[● ENABLED (~7s delay)]`) across Dashboard, Summary, and Tuning menus.
+- **Full Subsystem Toggles (Zero Options Left Without Toggle)**:
+  - Every tuning and optimization option displayed in status and diagnostics now possesses an individual toggle:
+    - **NM Wait-Online Delay**: `toggle_nm_wait_online`
+    - **Google TCP BBR Congestion Control**: `toggle_bbr`
+    - **Memory Swappiness (100 vs 60) & VFS Cache**: `toggle_swappiness`
+    - **ZRAM 50% Compressed RAM Swap**: `toggle_zram`
+    - **DHCP Hostname Leak Shield**: `toggle_dhcp_privacy`
+    - **Kernel Memory Privacy Hardening (dmesg & kptr)**: `toggle_kernel_hardening`
+    - **Avahi mDNS Discovery Broadcast Daemon**: `toggle_avahi`
+    - **CUPS Network Printer Polling (UDP 631)**: `toggle_cups_browsed`
+    - **ModemManager Cellular Serial Scanner**: `toggle_modemmanager`
+    - **All 3 Broadcast Daemons**: `toggle_broadcast_daemons`
+  - All toggles are exposed in CLI: `mint-admin tune <subsystem> [toggle|enable|disable|status]`.
+- **Interactive Performance, Privacy & Startup Toggle Hub (`Option 9` / `mint-admin tune menu`)**:
+  - Full-screen interactive hub presenting live indicators for all subsystems and 1-key instant toggles.
+- **Modern Curses / Ink-Style Terminal UI**:
+  - Upgraded ANSI Terminal Dashboard with Ink-style framing, Unicode box drawing (`╭─╮│╰─╯`, `┌─┐│└─┘`), and high-contrast status pill badges.
+  - Upgraded Curses / Whiptail GUI modal mode (`mint-admin tui --dialog` or `[D]`) with full curses dialog submenus for Tuning, Battery, MAC, and Timers.
+- **Comprehensive Automated Test Suite**:
+  - Expanded test suite to 92 automated tests in `tests/test_audit_fixes.sh` covering live sysctls, interface filters, TOML parsing, intermediate symlink traversal protection, non-TTY input, systemd units, and subsystem toggles.
+
+### Fixed & Hardened (Complete Security & Logic Audit Remediation)
+- **Critical #1 - DHCP Hostname Leak Shield Enforcement**:
+  - Replaced unsupported `/etc/NetworkManager/conf.d/` connection drop-in key with native NetworkManager profile modification: `nmcli con modify "$uuid" ipv4.dhcp-send-hostname no ipv6.dhcp-send-hostname no`.
+  - Updated `status_get_dhcp()` to directly inspect active connection profile state via `nmcli -g ipv4.dhcp-send-hostname` rather than relying on conf file existence.
+- **Critical #2 - Symlink Containment & Intermediate Traversal Immunity**:
+  - Implemented `is_safe_user_path "$user_home" "$target"` with realpath canonicalization and intermediate component walk to prevent directory traversal and symlink hijacking across `/root` and `/home/*`.
+  - Guarded all destructive operations in `clean_privacy()` (recent files, browser caches, thumbnail previews, trash bins) and `clean_user_cache()` against both leaf and intermediate symlinks.
+- **Critical #3 & #4 - Encrypted DNS Relays & Verification Fail-Stop**:
+  - Upgraded DNSCrypt anonymized relay sources to `resolvers-list/v3/relays.md` for `dnscrypt-proxy >= 2.0.45`.
+  - Added dynamic relay extraction from cached relays list via `get_active_relays()`, eliminating invalid/defunct relay names (`anon-ibksturm`, `anon-tiar-nl`).
+  - Added pre-modification `.bak` config snapshots and implemented `activate_dns_config()` helper ensuring resolution failure aborts with proper error logging rather than falsely declaring success.
+  - Hardened Tor SOCKS proxy configuration injection to verify active Tor daemon and validate successful top-level TOML placement.
+- **Critical #5 - Systemd Timer Privilege Escalation Fail-Stop**:
+  - Hardened `install_weekly_timer()` to abort with an error if copying/installing to root-owned canonical `/usr/local/sbin/mint-admin` fails, strictly preventing systemd unit from pointing to unprivileged user home paths.
+  - Quoted `Documentation="file://$exec_target"` in systemd unit definitions to handle paths with whitespace without `systemd-analyze verify` errors.
+  - Updated `uninstall_weekly_timer()` to remove `/usr/local/sbin/mint-admin`.
+- **Critical #6 - Dashboard & Whiptail Subshell Isolation**:
+  - Wrapped interactive actions in `run_menu_action` and `run_whiptail_action` using isolated subshells `( "$@" ) || rc=$?` so non-root `check_root` exit code 1 does not terminate the dashboard session.
+  - Guarded `show_tui_dashboard` against non-TTY stdin (`[ -t 0 ] || { show_help; return 0; }`).
+- **High #7 - TCP FastOpen Baseline Restoration**:
+  - Updated `disable_bbr` to restore `net.ipv4.tcp_fastopen` to recorded `BASE_FASTOPEN` rather than leaving it stuck at 3.
+- **High #8 - Tuning Baseline State Preservation**:
+  - Enhanced `save_tuning_baseline` to record baseline active states of `avahi-daemon`, `cups-browsed`, `ModemManager`, and `NetworkManager-wait-online.service`.
+  - Updated `revert_system_tuning` to restore services to their exact prior baseline state instead of unconditionally forcing all daemons active.
+- **High #9 - Swappiness Status Condition**:
+  - Fixed swappiness status condition to strictly check `[ "$swappiness" -eq 100 ]` rather than `-le 100`.
+- **High #10 & #14 - Non-Interactive `-y`/`--force` & MAC Cycling Prompt**:
+  - Wired `FORCE_YES` across destructive actions (`clean_privacy`, `run_complete_suite`).
+  - Added confirmation prompt before network MAC address cycling in `run_complete_suite` unless `--force` / `-y` is passed.
+- **High #11 - Single-Label DNS Leak Shield**:
+  - Added `[global-dns]` with empty `searches=` to NetworkManager drop-in and `ResolveUnicastSingleLabel=yes` to systemd-resolved drop-in to prevent `.lan` lookup leaks.
+- **High #12 - Concurrency Mutex Lock**:
+  - Added `acquire_lock()` using `flock -n 200` on `/var/run/mint-admin.lock` during privileged execution.
+- **High #13 - Privacy Scrubbing Safety**:
+  - Added confirmation prompt before purging `/var/crash/*` and core dumps in `clean_privacy` unless `--force` is specified.
+  - Added automatic rotation/truncation for dnscrypt query log if it exceeds 10MB during housekeeping.
+- **Medium & Hygiene Fixes**:
+  - Quoted `$0` in `check_root` guidance hints to handle paths containing spaces safely.
+  - Hardened battery sysfs node traversal to handle spaces safely using newline splitting.
+    - **ZRAM 50% Compressed RAM Swap**: `toggle_zram`
+    - **DHCP Hostname Leak Shield**: `toggle_dhcp_privacy`
+    - **Kernel Memory Privacy Hardening (dmesg & kptr)**: `toggle_kernel_hardening`
+    - **Avahi mDNS Discovery Broadcast Daemon**: `toggle_avahi`
+    - **CUPS Network Printer Polling (UDP 631)**: `toggle_cups_browsed`
+    - **ModemManager Cellular Serial Scanner**: `toggle_modemmanager`
+    - **All 3 Broadcast Daemons**: `toggle_broadcast_daemons`
+  - All toggles are exposed in CLI: `mint-admin tune <subsystem> [toggle|enable|disable|status]`.
+- **Interactive Performance, Privacy & Startup Toggle Hub (`Option 9` / `mint-admin tune menu`)**:
+  - Full-screen interactive hub presenting live indicators for all subsystems and 1-key instant toggles.
+- **Modern Curses / Ink-Style Terminal UI**:
+  - Upgraded ANSI Terminal Dashboard with Ink-style framing, Unicode box drawing (`╭─╮│╰─╯`, `┌─┐│└─┘`), and high-contrast status pill badges.
+  - Upgraded Curses / Whiptail GUI modal mode (`mint-admin tui --dialog` or `[D]`) with full curses dialog submenus for Tuning, Battery, MAC, and Timers.
+- **Test Suite Expansion**:
+  - Added Test 15 to `tests/test_audit_fixes.sh`, expanding test suite to 68 automated unit tests.
+
 ## [v0.2.1] - 2026-11-01
 
 ### Changed

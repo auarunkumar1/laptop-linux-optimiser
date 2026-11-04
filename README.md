@@ -1,6 +1,6 @@
 # Laptop Linux Optimizer (`laptop-linux-optimiser`)
 
-[![Release](https://img.shields.io/badge/version-v0.2.1-blue.svg)](https://github.com/auarunkumar1/laptop-linux-optimiser/releases)
+[![Release](https://img.shields.io/badge/version-v0.3.0-blue.svg)](https://github.com/auarunkumar1/laptop-linux-optimiser/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20Mint%20%7C%20Ubuntu%20%7C%20Debian-lightgrey.svg)]()
 [![Shell](https://img.shields.io/badge/shell-bash%20%3E%3D%204.4-brightgreen.svg)]()
@@ -108,20 +108,35 @@ sudo ./mint-admin.sh battery install 80
 sudo ./mint-admin.sh battery uninstall
 ```
 
-### System Performance & Kernel Tuning
+### System Performance, Startup & Subsystem Toggles
 ```bash
-# Check current tuning status
+# Check comprehensive performance & privacy tuning status
 ./mint-admin.sh tune status
 
-# Apply TCP BBR, ZRAM (50% RAM, zstd), Swappiness 100, and DHCP privacy
-# (Prompts before disabling broadcast daemons like cups-browsed / avahi)
-sudo ./mint-admin.sh tune apply
+# Launch the interactive Performance, Privacy & Startup Toggle Hub
+./mint-admin.sh tune menu
 
-# Apply non-interactively with --yes
-sudo ./mint-admin.sh tune apply --yes
+# Fast Desktop Boot: Toggle NetworkManager wait-online service (~7s delay removed)
+./mint-admin.sh wait-online status          # Check wait-online state
+sudo ./mint-admin.sh wait-online toggle     # Toggle between Fast Boot and Network Wait
+sudo ./mint-admin.sh wait-online disable    # Force Fast Desktop Boot (disable delay)
+sudo ./mint-admin.sh wait-online enable     # Enable wait-online delay
 
-# Revert all sysctls and services back to initial distro baseline defaults
-sudo ./mint-admin.sh tune revert
+# Individual Subsystem Toggles (Zero Options Left Without Toggle)
+sudo ./mint-admin.sh tune bbr toggle        # Toggle Google TCP BBR low-latency congestion control
+sudo ./mint-admin.sh tune swappiness toggle # Toggle swappiness (100/50 for ZRAM vs default 60/100)
+sudo ./mint-admin.sh tune zram toggle       # Toggle 50% RAM compressed swap (zstd)
+sudo ./mint-admin.sh tune dhcp toggle       # Toggle DHCP hostname leak shield
+sudo ./mint-admin.sh tune kernel toggle     # Toggle kernel memory privacy (dmesg & kptr restrict)
+sudo ./mint-admin.sh tune avahi toggle      # Toggle Avahi mDNS discovery daemon
+sudo ./mint-admin.sh tune cups toggle       # Toggle CUPS UDP 631 printer polling daemon
+sudo ./mint-admin.sh tune modem toggle      # Toggle ModemManager cellular scanner daemon
+sudo ./mint-admin.sh tune daemons toggle    # Toggle all 3 broadcast discovery daemons at once
+
+# One-Click Full Suite Tuning
+sudo ./mint-admin.sh tune apply             # Apply all recommended performance & privacy settings
+sudo ./mint-admin.sh tune apply --yes       # Apply non-interactively
+sudo ./mint-admin.sh tune revert            # Revert all sysctls and services to initial baseline defaults
 ```
 
 ### Encrypted DNS (`dnscrypt-proxy`)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Laptop Linux Optimizer & Master Administration Suite (mint-admin)
-# Version: 0.1.1
+# Version: 0.3.0
 #
 # Unified Laptop Optimization & Hardening Tool:
 #   1. Battery Diagnostics & Persistent Charge Limiter (ASUS & Generic BAT*)
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.1"
+VERSION="0.3.0"
 SCRIPT_PATH="$(realpath "$0")"
 
 # Colors & Formatting
@@ -56,6 +56,7 @@ IPV6_SYSCTL_CONF="/etc/sysctl.d/99-disable-ipv6.conf"
 BASELINE_SYSCTL="/var/lib/mint-admin/tuning-baseline.env"
 PROFILE_CONF="/etc/mint-admin-profile.conf"
 CANONICAL_BIN="/usr/local/sbin/mint-admin"
+LOCK_FILE="/var/run/mint-admin.lock"
 
 # ------------------------------------------------------------------------------
 # Helper Utilities
@@ -69,9 +70,52 @@ log_err()     { echo -e "${RED}[✗]${NC} $1"; }
 check_root() {
     if [ "${EUID:-$(id -u)}" -ne 0 ]; then
         echo -e "${RED}[-] Error: This operation requires root privileges.${NC}" >&2
-        echo -e "${YELLOW}[-] Please run with sudo: sudo $0 ${*:-}${NC}" >&2
+        echo -e "${YELLOW}[-] Please run with sudo: sudo \"$0\" ${*:-}${NC}" >&2
         exit 1
     fi
+    acquire_lock
+}
+
+acquire_lock() {
+    if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+        mkdir -p /var/run
+        exec 200>"$LOCK_FILE"
+        if ! flock -n 200; then
+            log_err "Another instance of mint-admin is currently running."
+            exit 1
+        fi
+    fi
+}
+
+is_safe_user_path() {
+    local user_home="$1"
+    local target="$2"
+
+    [ -d "$user_home" ] || return 1
+    [ -L "$user_home" ] && return 1
+
+    local real_h
+    real_h=$(realpath -q "$user_home") || return 1
+    [[ "$real_h" == "/home/"* || "$real_h" == "/root" ]] || return 1
+
+    local real_target
+    real_target=$(realpath -mq "$target") || return 1
+    [[ "$real_target" == "$real_h"/* ]] || return 1
+
+    # Ensure no existing intermediate path component is a symlink
+    local cur="$user_home"
+    local rel="${target#$user_home/}"
+    local part
+    IFS='/' read -ra parts <<< "$rel"
+    for part in "${parts[@]}"; do
+        [ -z "$part" ] && continue
+        cur="$cur/$part"
+        if [ -L "$cur" ]; then
+            return 1
+        fi
+    done
+
+    return 0
 }
 
 format_kb() {
@@ -119,7 +163,9 @@ find_battery_threshold_nodes() {
     shopt -s nullglob
     local nodes=(/sys/class/power_supply/BAT*/charge_control_end_threshold)
     [ "$was_nullglob" -eq 0 ] && shopt -u nullglob
-    echo "${nodes[@]:-}"
+    for n in "${nodes[@]}"; do
+        [ -f "$n" ] && printf '%s\n' "$n"
+    done
 }
 
 show_battery_status() {
@@ -233,16 +279,18 @@ set_battery_threshold() {
 
     check_root "battery" "set" "$val"
 
-    local nodes
-    nodes=$(find_battery_threshold_nodes)
-    if [ -z "$nodes" ]; then
+    local found_any=0
+    while IFS= read -r node; do
+        if [ -n "$node" ] && [ -f "$node" ]; then
+            echo "$val" > "$node"
+            found_any=1
+        fi
+    done < <(find_battery_threshold_nodes)
+
+    if [ "$found_any" -eq 0 ]; then
         log_err "No supported battery threshold interface found in /sys/class/power_supply/"
         exit 1
     fi
-
-    for node in $nodes; do
-        echo "$val" > "$node"
-    done
 
     echo "THRESHOLD=$val" > "$BATTERY_CONF"
     chmod 644 "$BATTERY_CONF"
@@ -371,11 +419,9 @@ uninstall_battery_service() {
     udevadm control --reload-rules 2>/dev/null || true
     systemctl daemon-reload
 
-    local nodes
-    nodes=$(find_battery_threshold_nodes)
-    for node in $nodes; do
-        echo "100" > "$node" 2>/dev/null || true
-    done
+    while IFS= read -r node; do
+        [ -n "$node" ] && [ -f "$node" ] && echo "100" > "$node" 2>/dev/null || true
+    done < <(find_battery_threshold_nodes)
     log_success "Battery limiter uninstalled. Charge threshold restored to 100%."
 }
 
@@ -396,12 +442,36 @@ check_dns_dependencies() {
     fi
 }
 
+get_active_relays() {
+    local relays=()
+    if [ -f "/var/cache/dnscrypt-proxy/relays.md" ]; then
+        mapfile -t relays < <(grep -E '^## anon-cs-[a-z]+$' /var/cache/dnscrypt-proxy/relays.md | sed 's/^## //' | head -n 3)
+    fi
+    if [ ${#relays[@]} -eq 0 ]; then
+        relays=('anon-cs-de' 'anon-cs-berlin' 'anon-cs-austria')
+    fi
+    local formatted=""
+    for r in "${relays[@]}"; do
+        [ -n "$formatted" ] && formatted="$formatted, "
+        formatted="$formatted'$r'"
+    done
+    echo "[$formatted]"
+}
+
 check_tor_service() {
     log_info "Checking Tor service..."
     if ! command -v tor &>/dev/null; then
+        if [ "${FORCE_YES:-0}" -ne 1 ] && [ -t 0 ]; then
+            read -r -p "Tor is not installed. Install Tor package now? [y/N]: " tor_ans
+            [[ "$tor_ans" =~ ^[Yy]$ ]] || { log_err "Tor installation declined."; return 1; }
+        fi
         apt-get update && apt-get install -y tor
     fi
     systemctl enable --now tor
+    if ! systemctl is-active --quiet tor; then
+        log_err "Tor service failed to start or activate."
+        return 1
+    fi
     log_success "Tor is active on 127.0.0.1:9050."
 }
 
@@ -412,16 +482,28 @@ apply_dnscrypt_config() {
 
     log_info "Applying settings to $DNS_CONFIG..."
 
+    # Pre-modification backup snapshot
+    cp "$DNS_CONFIG" "${DNS_CONFIG}.bak"
+
     sed -i "s/^listen_addresses = .*/listen_addresses = []/" "$DNS_CONFIG"
-    sed -i "s/^server_names = .*/server_names = $servers/" "$DNS_CONFIG"
+    if grep -q "^server_names =" "$DNS_CONFIG"; then
+        sed -i "s/^server_names = .*/server_names = $servers/" "$DNS_CONFIG"
+    else
+        sed -i "/^listen_addresses =/a server_names = $servers" "$DNS_CONFIG"
+    fi
 
     # Always strip existing proxy and force_tcp settings before re-applying
     sed -i '/^[[:space:]]*proxy[[:space:]]*=/d; /^[[:space:]]*force_tcp[[:space:]]*=/d' "$DNS_CONFIG"
 
     if [[ "$use_tor" == "true" ]]; then
         log_info "Routing DNS queries through Tor Onion proxy (127.0.2.1 -> 127.0.0.1:9050)..."
-        # Insert at the top-level table immediately following server_names, before any [section]
+        check_tor_service || { log_err "Tor service is required but unavailable."; cp "${DNS_CONFIG}.bak" "$DNS_CONFIG"; return 1; }
         sed -i "/^server_names =/a proxy = 'socks5://127.0.0.1:9050'\nforce_tcp = true" "$DNS_CONFIG"
+        if ! grep -q "^proxy = 'socks5://127.0.0.1:9050'" "$DNS_CONFIG"; then
+            log_err "Failed to inject Tor proxy configuration into $DNS_CONFIG."
+            cp "${DNS_CONFIG}.bak" "$DNS_CONFIG"
+            return 1
+        fi
     fi
 
     if [[ "$use_anonymized" == "true" ]]; then
@@ -430,27 +512,31 @@ apply_dnscrypt_config() {
             cat << 'EOF' >> "$DNS_CONFIG"
 
 [sources.'relays']
-  url = 'https://download.dnscrypt.info/resolvers-list/v2/relays.md'
+  url = 'https://download.dnscrypt.info/resolvers-list/v3/relays.md'
   cache_file = '/var/cache/dnscrypt-proxy/relays.md'
   minisign_key = 'RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3'
   refresh_delay = 72
   prefix = ''
 EOF
+        else
+            sed -i 's|/resolvers-list/v2/relays.md|/resolvers-list/v3/relays.md|' "$DNS_CONFIG"
         fi
 
+        local active_relays
+        active_relays=$(get_active_relays)
         sed -i '/^\[anonymized_dns\]/,/^\[/ { /^routes =/d }' "$DNS_CONFIG"
         if ! grep -q "^\[anonymized_dns\]" "$DNS_CONFIG"; then
             echo -e "\n[anonymized_dns]" >> "$DNS_CONFIG"
         fi
-        sed -i "/^\[anonymized_dns\]/a routes = [{ server_name='*', via=['anon-cs-de', 'anon-ibksturm', 'anon-tiar-nl'] }]" "$DNS_CONFIG"
+        sed -i "/^\[anonymized_dns\]/a routes = [{ server_name='*', via=$active_relays }]" "$DNS_CONFIG"
     else
         sed -i '/^routes = \[{ server_name='\''\*'\''/d' "$DNS_CONFIG"
     fi
 
     if ! dnscrypt-proxy -config "$DNS_CONFIG" -check &>/dev/null; then
         log_err "Configuration syntax test failed! Reverting $DNS_CONFIG..."
-        cp "$DNS_BACKUP" "$DNS_CONFIG"
-        exit 1
+        cp "${DNS_CONFIG}.bak" "$DNS_CONFIG"
+        return 1
     fi
     log_success "dnscrypt-proxy configuration syntax verified."
 }
@@ -460,6 +546,9 @@ setup_system_dns() {
 
     mkdir -p /etc/NetworkManager/conf.d
     cat <<EOF > "$NM_DNS_DROPIN"
+[global-dns]
+searches=
+
 [global-dns-domain-*]
 servers=127.0.2.1
 EOF
@@ -472,9 +561,23 @@ DNS=127.0.2.1
 Domains=~.
 FallbackDNS=
 DNSSEC=no
+ResolveUnicastSingleLabel=yes
 EOF
     fi
     log_success "System DNS directed to local proxy (127.0.2.1)."
+}
+
+activate_dns_config() {
+    local profile_desc="$1"
+    if ! setup_system_dns; then
+        log_err "Failed to configure system DNS drop-ins."
+        return 1
+    fi
+    if ! restart_dns_services; then
+        log_err "Failed to restart DNS services or verify resolution."
+        return 1
+    fi
+    log_success "$profile_desc active."
 }
 
 restart_dns_services() {
@@ -549,7 +652,7 @@ show_dns_status() {
     echo -e "${BOLD}               Encrypted DNS Status${NC}"
     echo -e "${CYAN}========================================================${NC}"
 
-    if systemctl is-active dnscrypt-proxy.service &>/dev/null || systemctl is-active dnscrypt-proxy.socket &>/dev/null; then
+    if systemctl is-active --quiet dnscrypt-proxy.service 2>/dev/null; then
         echo -e "dnscrypt-proxy   : ${GREEN}ACTIVE & RUNNING${NC}"
         if [ -f "$DNS_CONFIG" ]; then
             local current_servers
@@ -587,77 +690,63 @@ apply_dns_profile() {
 
     case "$opt" in
         0|failover)
-            apply_dnscrypt_config "['quad9-doh-ip4-port443-filter-pri', 'cloudflare', 'adguard-dns-doh']" "false" "false"
-            setup_system_dns && restart_dns_services
-            log_success "Auto-Failover Pool active (Quad9 + Cloudflare + AdGuard)."
+            apply_dnscrypt_config "['quad9-doh-ip4-port443-filter-pri', 'cloudflare', 'adguard-dns-doh']" "false" "false" && \
+            activate_dns_config "Auto-Failover Pool (Quad9 + Cloudflare + AdGuard)"
             ;;
         1|cloudflare)
-            apply_dnscrypt_config "['cloudflare', 'cloudflare-ipv6']" "false" "false"
-            setup_system_dns && restart_dns_services
-            log_success "Cloudflare Anycast DoH active."
+            apply_dnscrypt_config "['cloudflare', 'cloudflare-ipv6']" "false" "false" && \
+            activate_dns_config "Cloudflare Anycast DoH"
             ;;
         2|google)
-            apply_dnscrypt_config "['google', 'google-ipv6']" "false" "false"
-            setup_system_dns && restart_dns_services
-            log_success "Google Public DNS active."
+            apply_dnscrypt_config "['google', 'google-ipv6']" "false" "false" && \
+            activate_dns_config "Google Public DNS"
             ;;
         3|quad9)
-            apply_dnscrypt_config "['quad9-doh-ip4-port443-filter-pri', 'quad9-doh-ip6-port443-filter-pri']" "false" "false"
-            setup_system_dns && restart_dns_services
-            log_success "Quad9 DoH active (Swiss malware filter)."
+            apply_dnscrypt_config "['quad9-doh-ip4-port443-filter-pri', 'quad9-doh-ip6-port443-filter-pri']" "false" "false" && \
+            activate_dns_config "Quad9 DoH (Swiss malware filter)"
             ;;
         4|adguard)
-            apply_dnscrypt_config "['adguard-dns-doh', 'adguard-dns-doh-ipv6']" "false" "false"
-            setup_system_dns && restart_dns_services
-            log_success "AdGuard Adblock DoH active."
+            apply_dnscrypt_config "['adguard-dns-doh', 'adguard-dns-doh-ipv6']" "false" "false" && \
+            activate_dns_config "AdGuard Adblock DoH"
             ;;
         5|controld)
-            apply_dnscrypt_config "['controld-block-malware-ad']" "false" "false"
-            setup_system_dns && restart_dns_services
-            log_success "Control D Adblock DoH active."
+            apply_dnscrypt_config "['controld-block-malware-ad']" "false" "false" && \
+            activate_dns_config "Control D Adblock DoH"
             ;;
         6|libredns)
-            apply_dnscrypt_config "['libredns']" "false" "false"
-            setup_system_dns && restart_dns_services
-            log_success "LibreDNS Standard active."
+            apply_dnscrypt_config "['libredns']" "false" "false" && \
+            activate_dns_config "LibreDNS Standard"
             ;;
         7|libredns-adblock)
-            apply_dnscrypt_config "['libredns-noads']" "false" "false"
-            setup_system_dns && restart_dns_services
-            log_success "LibreDNS with Adblock active."
+            apply_dnscrypt_config "['libredns-noads']" "false" "false" && \
+            activate_dns_config "LibreDNS with Adblock"
             ;;
         8|cloudflare-odoh)
-            apply_dnscrypt_config "['cloudflare']" "true" "false"
-            setup_system_dns && restart_dns_services
-            log_success "Cloudflare via ODoH (Anonymized Relays) active."
+            apply_dnscrypt_config "['cloudflare']" "true" "false" && \
+            activate_dns_config "Cloudflare via ODoH (Anonymized Relays)"
             ;;
         9|quad9-odoh)
-            apply_dnscrypt_config "['quad9-doh-ip4-port443-filter-pri']" "true" "false"
-            setup_system_dns && restart_dns_services
-            log_success "Quad9 via ODoH active."
+            apply_dnscrypt_config "['quad9-doh-ip4-port443-filter-pri']" "true" "false" && \
+            activate_dns_config "Quad9 via ODoH"
             ;;
         10|libredns-odoh)
-            apply_dnscrypt_config "['libredns-noads']" "true" "false"
-            setup_system_dns && restart_dns_services
-            log_success "LibreDNS via ODoH active."
+            apply_dnscrypt_config "['libredns-noads']" "true" "false" && \
+            activate_dns_config "LibreDNS via ODoH"
             ;;
         11|quad9-tor)
-            check_tor_service
-            apply_dnscrypt_config "['quad9-doh-ip4-port443-filter-pri']" "false" "true"
-            setup_system_dns && restart_dns_services
-            log_success "Quad9 via Tor Onion routing active."
+            check_tor_service && \
+            apply_dnscrypt_config "['quad9-doh-ip4-port443-filter-pri']" "false" "true" && \
+            activate_dns_config "Quad9 via Tor Onion routing"
             ;;
         12|libredns-tor)
-            check_tor_service
-            apply_dnscrypt_config "['libredns-noads']" "false" "true"
-            setup_system_dns && restart_dns_services
-            log_success "LibreDNS Adblock via Tor active."
+            check_tor_service && \
+            apply_dnscrypt_config "['libredns-noads']" "false" "true" && \
+            activate_dns_config "LibreDNS Adblock via Tor"
             ;;
         13|cloudflare-tor)
-            check_tor_service
-            apply_dnscrypt_config "['cloudflare']" "false" "true"
-            setup_system_dns && restart_dns_services
-            log_success "Cloudflare via Tor active."
+            check_tor_service && \
+            apply_dnscrypt_config "['cloudflare']" "false" "true" && \
+            activate_dns_config "Cloudflare via Tor"
             ;;
         14|revert|dhcp)
             revert_dns_changes
@@ -971,8 +1060,10 @@ clean_privacy() {
     for h in /root /home/*; do
         [ -d "$h" ] || continue
         [ -L "$h" ] && continue
+        is_safe_user_path "$h" "$h" || continue
+
         local recent_file="$h/.local/share/recently-used.xbel"
-        if [ -f "$recent_file" ] && [ ! -L "$recent_file" ]; then
+        if [ -f "$recent_file" ] && is_safe_user_path "$h" "$recent_file"; then
             local tmp_recent="${recent_file}.tmp.$$"
             echo '<?xml version="1.0" encoding="UTF-8"?><xbel version="1.0" xmlns:bookmark="http://www.freedesktop.org/standards/desktop-bookmarks" xmlns:mime="http://www.freedesktop.org/standards/shared-mime-info"></xbel>' > "$tmp_recent"
             local owner
@@ -983,8 +1074,12 @@ clean_privacy() {
             echo "  - Reset recent files history for: $(basename "$h")"
         fi
 
-        [ ! -L "$h/.local/share/.vivaldi_reporting_data" ] && rm -f "$h/.local/share/.vivaldi_reporting_data" 2>/dev/null || true
-        [ ! -L "$h/.local/share/zeitgeist" ] && rm -rf "$h/.local/share/zeitgeist" 2>/dev/null || true
+        if is_safe_user_path "$h" "$h/.local/share/.vivaldi_reporting_data" && [ ! -L "$h/.local/share/.vivaldi_reporting_data" ]; then
+            rm -f "$h/.local/share/.vivaldi_reporting_data" 2>/dev/null || true
+        fi
+        if is_safe_user_path "$h" "$h/.local/share/zeitgeist" && [ ! -L "$h/.local/share/zeitgeist" ]; then
+            rm -rf "$h/.local/share/zeitgeist" 2>/dev/null || true
+        fi
     done
     echo "[+] Activity history cleared."
     echo ""
@@ -998,8 +1093,9 @@ clean_privacy() {
     for h in /root /home/*; do
         [ -d "$h" ] || continue
         [ -L "$h" ] && continue
+        is_safe_user_path "$h" "$h" || continue
 
-        if [ -d "$h/.cache/mozilla/firefox" ] && [ ! -L "$h/.cache/mozilla/firefox" ]; then
+        if is_safe_user_path "$h" "$h/.cache/mozilla/firefox" && [ -d "$h/.cache/mozilla/firefox" ]; then
             find "$h/.cache/mozilla/firefox" -mindepth 1 -maxdepth 3 -type d \( -name "cache2" -o -name "startupCache" -o -name "jumpListCache" \) -exec rm -rf {} + 2>/dev/null || true
             echo "  - Cleaned Firefox caches in $(basename "$h")"
         fi
@@ -1011,13 +1107,13 @@ clean_privacy() {
             "$h/.cache/vivaldi"
         )
         for cdir in "${chromium_cache_dirs[@]}"; do
-            if [ -d "$cdir" ] && [ ! -L "$cdir" ]; then
+            if is_safe_user_path "$h" "$cdir" && [ -d "$cdir" ]; then
                 find "$cdir" -mindepth 1 -maxdepth 4 -type d \( -name "Cache" -o -name "GPUCache" -o -name "Code Cache" -o -name "ShaderCache" -o -name "GrShaderCache" \) -exec rm -rf {} + 2>/dev/null || true
                 echo "  - Cleaned $(basename "$cdir") caches in $(basename "$h")"
             fi
         done
 
-        if [ -d "$h/.var/app" ] && [ ! -L "$h/.var/app" ]; then
+        if is_safe_user_path "$h" "$h/.var/app" && [ -d "$h/.var/app" ]; then
             find "$h/.var/app" -mindepth 2 -maxdepth 4 -type d -name "cache" -exec rm -rf {} + 2>/dev/null || true
         fi
     done
@@ -1029,7 +1125,9 @@ clean_privacy() {
     for h in /root /home/*; do
         [ -d "$h" ] || continue
         [ -L "$h" ] && continue
-        if [ -d "$h/.cache/thumbnails" ] && [ ! -L "$h/.cache/thumbnails" ]; then
+        is_safe_user_path "$h" "$h" || continue
+
+        if is_safe_user_path "$h" "$h/.cache/thumbnails" && [ -d "$h/.cache/thumbnails" ]; then
             find "$h/.cache/thumbnails" -mindepth 1 -maxdepth 3 ! -type l -delete 2>/dev/null || true
             echo "  - Purged thumbnail previews in: $(basename "$h")"
         fi
@@ -1042,10 +1140,12 @@ clean_privacy() {
     for h in /root /home/*; do
         [ -d "$h" ] || continue
         [ -L "$h" ] && continue
-        if [ -d "$h/.local/share/Trash" ] && [ ! -L "$h/.local/share/Trash" ]; then
+        is_safe_user_path "$h" "$h" || continue
+
+        if is_safe_user_path "$h" "$h/.local/share/Trash" && [ -d "$h/.local/share/Trash" ]; then
             for tsub in files info; do
                 local tdir="$h/.local/share/Trash/$tsub"
-                if [ -d "$tdir" ] && [ ! -L "$tdir" ]; then
+                if is_safe_user_path "$h" "$tdir" && [ -d "$tdir" ]; then
                     find "$tdir" -mindepth 1 -maxdepth 4 ! -type l -delete 2>/dev/null || true
                 fi
             done
@@ -1057,9 +1157,18 @@ clean_privacy() {
 
     # 6. Crash Reports & Core Dumps
     echo ">>> [6/6] Purging Crash Logs & Memory Core Dumps..."
-    rm -rf /var/crash/* 2>/dev/null || true
-    rm -rf /var/lib/systemd/coredump/* 2>/dev/null || true
-    echo "  - Removed system crash reports and core dumps."
+    local do_crash=1
+    if [ "${FORCE_YES:-0}" -ne 1 ] && [ -t 0 ]; then
+        read -r -p "  Purge system crash reports (/var/crash) and core dumps? [y/N]: " crash_ans
+        [[ "$crash_ans" =~ ^[Yy]$ ]] || do_crash=0
+    fi
+    if [ "$do_crash" -eq 1 ]; then
+        rm -rf /var/crash/* 2>/dev/null || true
+        rm -rf /var/lib/systemd/coredump/* 2>/dev/null || true
+        echo "  - Removed system crash reports and core dumps."
+    else
+        echo "  - Preserved system crash reports and core dumps."
+    fi
     echo "[+] Crash reports cleaned."
     echo ""
 
@@ -1159,6 +1268,15 @@ clean_systemd() {
         echo "  - Journal footprint after vacuuming: $j_after"
     fi
 
+    if [ -f "/var/log/dnscrypt-proxy/query.log" ]; then
+        local qlog_size
+        qlog_size=$(stat -c '%s' "/var/log/dnscrypt-proxy/query.log" 2>/dev/null || echo 0)
+        if [ "$qlog_size" -gt 10485760 ]; then
+            : > "/var/log/dnscrypt-proxy/query.log" 2>/dev/null || true
+            echo "  - Truncated oversized dnscrypt-proxy query log (>10MB)."
+        fi
+    fi
+
     local failed_units
     failed_units=$(systemctl --failed --no-legend 2>/dev/null || true)
     if [ -n "$failed_units" ]; then
@@ -1177,7 +1295,8 @@ clean_user_cache() {
     for h in /root /home/*; do
         [ -d "$h" ] || continue
         [ -L "$h" ] && continue
-        if [ -d "$h/.cache/thumbnails" ] && [ ! -L "$h/.cache/thumbnails" ]; then
+        is_safe_user_path "$h" "$h" || continue
+        if [ -d "$h/.cache/thumbnails" ] && [ ! -L "$h/.cache/thumbnails" ] && is_safe_user_path "$h" "$h/.cache/thumbnails"; then
             find "$h/.cache/thumbnails" -mindepth 1 -maxdepth 4 -type f ! -type l -mtime +14 -delete 2>/dev/null || true
         fi
     done
@@ -1283,7 +1402,18 @@ run_complete_suite() {
     clean_user_cache
 
     clean_privacy "privacy"
-    randomize_mac "mac"
+
+    local do_mac=1
+    if [ "${FORCE_YES:-0}" -ne 1 ] && [ -t 0 ]; then
+        echo ""
+        read -r -p "Randomizing MAC addresses will momentarily cycle network connections. Proceed? [y/N]: " mac_ans
+        [[ "$mac_ans" =~ ^[Yy]$ ]] || do_mac=0
+    fi
+    if [ "$do_mac" -eq 1 ]; then
+        randomize_mac "mac"
+    else
+        log_info "Skipping MAC address randomization as requested."
+    fi
 
     print_summary "$avail_before"
 }
@@ -1303,14 +1433,17 @@ install_weekly_timer() {
     if [ "$owner_uid" != "0" ] || [[ "$SCRIPT_PATH" == /home/* ]]; then
         log_info "Securing systemd timer: installing root-owned script to $CANONICAL_BIN..."
         mkdir -p /usr/local/sbin
-        install -m 755 -o root -g root "$SCRIPT_PATH" "$CANONICAL_BIN" 2>/dev/null || cp "$SCRIPT_PATH" "$CANONICAL_BIN"
-        [ -x "$CANONICAL_BIN" ] && exec_target="$CANONICAL_BIN"
+        if ! install -m 755 -o root -g root "$SCRIPT_PATH" "$CANONICAL_BIN"; then
+            log_err "Failed to securely install root-owned binary to $CANONICAL_BIN."
+            exit 1
+        fi
+        exec_target="$CANONICAL_BIN"
     fi
 
     cat << EOF > "$OPTIMIZER_SERVICE"
 [Unit]
 Description=Linux Mint Weekly System Optimizer & Housekeeping
-Documentation=file://$exec_target
+Documentation="file://$exec_target"
 After=network.target
 
 [Service]
@@ -1353,6 +1486,10 @@ uninstall_weekly_timer() {
     systemctl stop mint-optimizer.timer 2>/dev/null || true
     systemctl disable mint-optimizer.timer 2>/dev/null || true
     rm -f "$OPTIMIZER_SERVICE" "$OPTIMIZER_TIMER"
+    if [ -f "$CANONICAL_BIN" ]; then
+        rm -f "$CANONICAL_BIN"
+        log_info "Removed canonical binary: $CANONICAL_BIN"
+    fi
     systemctl daemon-reload
 
     log_success "Weekly optimization timer uninstalled."
@@ -1380,6 +1517,33 @@ show_timer_status() {
 # MODULE 7: System Performance Tuning & Privacy Hardening
 # ==============================================================================
 
+save_tuning_baseline() {
+    mkdir -p /var/lib/mint-admin
+    if [ ! -f "$BASELINE_SYSCTL" ]; then
+        local avahi_active=0 cups_active=0 modem_active=0 wait_active=0
+        systemctl is-active --quiet avahi-daemon 2>/dev/null && avahi_active=1
+        systemctl is-active --quiet cups-browsed 2>/dev/null && cups_active=1
+        systemctl is-active --quiet ModemManager 2>/dev/null && modem_active=1
+        systemctl is-enabled --quiet NetworkManager-wait-online.service 2>/dev/null && wait_active=1
+
+        {
+            echo "BASE_SUID_DUMPABLE=$(sysctl -n fs.suid_dumpable 2>/dev/null || echo 2)"
+            echo "BASE_BPF_DISABLED=$(sysctl -n kernel.unprivileged_bpf_disabled 2>/dev/null || echo 2)"
+            echo "BASE_FASTOPEN=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 1)"
+            echo "BASE_SWAPPINESS=$(sysctl -n vm.swappiness 2>/dev/null || echo 60)"
+            echo "BASE_VFS_PRESSURE=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo 100)"
+            echo "BASE_DMESG_RESTRICT=$(sysctl -n kernel.dmesg_restrict 2>/dev/null || echo 0)"
+            echo "BASE_KPTR_RESTRICT=$(sysctl -n kernel.kptr_restrict 2>/dev/null || echo 1)"
+            echo "BASE_TCP_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic)"
+            echo "BASE_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo fq_codel)"
+            echo "BASE_AVAHI_ACTIVE=$avahi_active"
+            echo "BASE_CUPS_ACTIVE=$cups_active"
+            echo "BASE_MODEM_ACTIVE=$modem_active"
+            echo "BASE_NM_WAIT_ACTIVE=$wait_active"
+        } > "$BASELINE_SYSCTL" 2>/dev/null || true
+    fi
+}
+
 show_tuning_status() {
     echo -e "${CYAN}========================================================${NC}"
     echo -e "${BOLD}         System Performance & Privacy Tuning Status${NC}"
@@ -1399,7 +1563,7 @@ show_tuning_status() {
     local swappiness vfs_press
     swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "Unknown")
     vfs_press=$(cat /proc/sys/vm/vfs_cache_pressure 2>/dev/null || echo "Unknown")
-    if [[ "$swappiness" =~ ^[0-9]+$ ]] && [ "$swappiness" -le 100 ]; then
+    if [[ "$swappiness" =~ ^[0-9]+$ ]] && [ "$swappiness" -eq 100 ]; then
         echo -e "vm.swappiness          : ${GREEN}$swappiness${NC} (Optimized for ZRAM & NVMe SSD)"
     else
         echo -e "vm.swappiness          : ${YELLOW}$swappiness${NC} (Default / standard disk swap)"
@@ -1407,16 +1571,16 @@ show_tuning_status() {
     echo -e "vm.vfs_cache_pressure  : $vfs_press"
 
     # 3. ZRAM Compressed Swap
-    if swapon --show | grep -q "zram"; then
+    if swapon --show 2>/dev/null | grep -q "zram"; then
         local zram_info
-        zram_info=$(swapon --show | grep "zram" | awk '{print $3, "used: "$4, "prio: "$5}')
+        zram_info=$(swapon --show 2>/dev/null | grep "zram" | awk '{print $3, "used: "$4, "prio: "$5}')
         echo -e "ZRAM Compressed Swap   : ${GREEN}ACTIVE${NC} ($zram_info)"
     else
         echo -e "ZRAM Compressed Swap   : ${YELLOW}INACTIVE${NC} (Using standard disk swap)"
     fi
 
     # 4. Hostname Privacy over DHCP
-    if [ -f "$DHCP_PRIVACY_CONF" ] && grep -q "ipv4.dhcp-send-hostname=false" "$DHCP_PRIVACY_CONF" 2>/dev/null; then
+    if [ "$(status_get_dhcp)" = "BLOCKED (Protected)" ]; then
         echo -e "DHCP Hostname Leak     : ${GREEN}BLOCKED${NC} (Hostname not sent to Wi-Fi routers)"
     else
         echo -e "DHCP Hostname Leak     : ${YELLOW}EXPOSED${NC} (Routers log your PC hostname)"
@@ -1431,9 +1595,9 @@ show_tuning_status() {
 
     # 6. Background Broadcast Daemons
     local avahi_st cups_st modem_st
-    systemctl is-active --quiet avahi-daemon && avahi_st="${YELLOW}ACTIVE (mDNS broadcasting)${NC}" || avahi_st="${GREEN}DISABLED${NC}"
-    systemctl is-active --quiet cups-browsed && cups_st="${YELLOW}ACTIVE (UDP 631 polling)${NC}" || cups_st="${GREEN}DISABLED${NC}"
-    systemctl is-active --quiet ModemManager && modem_st="${YELLOW}ACTIVE${NC}" || modem_st="${GREEN}DISABLED${NC}"
+    systemctl is-active --quiet avahi-daemon 2>/dev/null && avahi_st="${YELLOW}ACTIVE (mDNS broadcasting)${NC}" || avahi_st="${GREEN}DISABLED${NC}"
+    systemctl is-active --quiet cups-browsed 2>/dev/null && cups_st="${YELLOW}ACTIVE (UDP 631 polling)${NC}" || cups_st="${GREEN}DISABLED${NC}"
+    systemctl is-active --quiet ModemManager 2>/dev/null && modem_st="${YELLOW}ACTIVE${NC}" || modem_st="${GREEN}DISABLED${NC}"
     echo -e "mDNS Hostname Broadcast: $avahi_st"
     echo -e "CUPS Network Polling   : $cups_st"
     echo -e "ModemManager Daemon    : $modem_st"
@@ -1459,99 +1623,140 @@ show_tuning_status() {
     echo -e "${CYAN}========================================================${NC}"
 }
 
-apply_system_tuning() {
-    check_root "tune" "apply"
+# ------------------------------------------------------------------------------
+# Individual Subsystem Toggles
+# ------------------------------------------------------------------------------
 
-    echo -e "${CYAN}========================================================${NC}"
-    echo -e "${BOLD}     Applying Performance & Privacy System Tuning${NC}"
-    echo -e "${CYAN}========================================================${NC}"
+# 1. NM Wait-Online Delay (Fast Desktop Boot)
+enable_nm_wait_online() {
+    check_root "tune" "wait-online" "enable"
+    log_info "Enabling NetworkManager-wait-online service..."
+    systemctl unmask NetworkManager-wait-online.service 2>/dev/null || true
+    systemctl enable NetworkManager-wait-online.service 2>/dev/null || true
+    log_success "NM Wait-Online Delay enabled (system boot delays until network is up)."
+}
 
-    # Capture initial baseline values before first modification
-    mkdir -p /var/lib/mint-admin
-    if [ ! -f "$BASELINE_SYSCTL" ]; then
-        {
-            echo "BASE_SUID_DUMPABLE=$(sysctl -n fs.suid_dumpable 2>/dev/null || echo 2)"
-            echo "BASE_BPF_DISABLED=$(sysctl -n kernel.unprivileged_bpf_disabled 2>/dev/null || echo 2)"
-            echo "BASE_FASTOPEN=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 1)"
-            echo "BASE_SWAPPINESS=$(sysctl -n vm.swappiness 2>/dev/null || echo 60)"
-            echo "BASE_VFS_PRESSURE=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo 100)"
-            echo "BASE_DMESG_RESTRICT=$(sysctl -n kernel.dmesg_restrict 2>/dev/null || echo 0)"
-            echo "BASE_KPTR_RESTRICT=$(sysctl -n kernel.kptr_restrict 2>/dev/null || echo 1)"
-            echo "BASE_TCP_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic)"
-            echo "BASE_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo fq_codel)"
-        } > "$BASELINE_SYSCTL"
+disable_nm_wait_online() {
+    check_root "tune" "wait-online" "disable"
+    log_info "Disabling NetworkManager-wait-online service..."
+    systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+    log_success "NM Wait-Online Delay disabled (~7s delay removed for fast desktop boot)."
+}
+
+toggle_nm_wait_online() {
+    check_root "tune" "wait-online" "toggle"
+    if systemctl is-enabled --quiet NetworkManager-wait-online.service 2>/dev/null; then
+        disable_nm_wait_online
+    else
+        enable_nm_wait_online
     fi
+}
 
-    # 1. Enable Google BBR and Performance sysctls
-    log_info "Configuring TCP BBR & memory performance sysctls..."
+# 2. TCP Congestion Control (Google BBR)
+enable_bbr() {
+    check_root "tune" "bbr" "enable"
+    save_tuning_baseline
+    log_info "Enabling Google TCP BBR Congestion Control..."
     mkdir -p /etc/modules-load.d /etc/sysctl.d
     echo "tcp_bbr" > "$BBR_MODULE_CONF"
     modprobe tcp_bbr 2>/dev/null || true
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || true
 
-    cat << 'EOF' > "$PERF_SYSCTL"
-# Performance & TCP Tuning (mint-admin)
+    touch "$PERF_SYSCTL"
+    sed -i '/^net\.core\.default_qdisc/d; /^net\.ipv4\.tcp_congestion_control/d; /^net\.ipv4\.tcp_fastopen/d' "$PERF_SYSCTL" 2>/dev/null || true
+    cat << 'EOF' >> "$PERF_SYSCTL"
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
+EOF
+    log_success "TCP BBR active (optimal low-latency congestion control, qdisc: fq)."
+}
 
-# Memory & ZRAM Swappiness Optimization (Balanced for 16GB laptop)
+disable_bbr() {
+    check_root "tune" "bbr" "disable"
+    log_info "Disabling TCP BBR and restoring baseline congestion control..."
+    rm -f "$BBR_MODULE_CONF"
+    local b_cc="cubic" b_qdisc="fq_codel" b_fastopen=1
+    if [ -f "$BASELINE_SYSCTL" ]; then
+        # shellcheck disable=SC1090
+        . "$BASELINE_SYSCTL"
+        b_cc="${BASE_TCP_CC:-cubic}"
+        b_qdisc="${BASE_QDISC:-fq_codel}"
+        b_fastopen="${BASE_FASTOPEN:-1}"
+    fi
+    sysctl -w net.ipv4.tcp_congestion_control="$b_cc" >/dev/null 2>&1 || true
+    sysctl -w net.core.default_qdisc="$b_qdisc" >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_fastopen="$b_fastopen" >/dev/null 2>&1 || true
+    if [ -f "$PERF_SYSCTL" ]; then
+        sed -i '/^net\.core\.default_qdisc/d; /^net\.ipv4\.tcp_congestion_control/d; /^net\.ipv4\.tcp_fastopen/d' "$PERF_SYSCTL"
+        grep -qE '^[a-zA-Z]' "$PERF_SYSCTL" 2>/dev/null || rm -f "$PERF_SYSCTL"
+    fi
+    log_success "TCP Congestion Control restored to baseline default ($b_cc, qdisc: $b_qdisc, fastopen: $b_fastopen)."
+}
+
+toggle_bbr() {
+    check_root "tune" "bbr" "toggle"
+    local cur_cc
+    cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "Unknown")
+    if [ "$cur_cc" = "bbr" ]; then
+        disable_bbr
+    else
+        enable_bbr
+    fi
+}
+
+# 3. Memory Swappiness & Cache Pressure
+enable_swappiness() {
+    check_root "tune" "swappiness" "enable"
+    save_tuning_baseline
+    log_info "Configuring optimized swappiness (100) and vfs_cache_pressure (50)..."
+    mkdir -p /etc/sysctl.d
+    touch "$PERF_SYSCTL"
+    sed -i '/^vm\.swappiness/d; /^vm\.vfs_cache_pressure/d' "$PERF_SYSCTL" 2>/dev/null || true
+    cat << 'EOF' >> "$PERF_SYSCTL"
 vm.swappiness = 100
 vm.vfs_cache_pressure = 50
 EOF
+    sysctl -w vm.swappiness=100 >/dev/null 2>&1 || true
+    sysctl -w vm.vfs_cache_pressure=50 >/dev/null 2>&1 || true
+    log_success "Memory tuning active: vm.swappiness=100, vm.vfs_cache_pressure=50 (optimized for ZRAM/SSD)."
+}
 
-    # 2. Kernel Privacy & Anti-Leak Sysctls
-    log_info "Configuring kernel privacy & memory protection sysctls..."
-    cat << 'EOF' > "$PRIVACY_SYSCTL"
-# Kernel Privacy & Security Hardening (mint-admin)
-kernel.dmesg_restrict = 1
-kernel.kptr_restrict = 2
-kernel.unprivileged_bpf_disabled = 1
-fs.suid_dumpable = 0
-EOF
-
-    sysctl --system >/dev/null 2>&1 || sysctl -p "$PERF_SYSCTL" "$PRIVACY_SYSCTL" >/dev/null 2>&1 || true
-    log_success "Kernel performance & privacy sysctls active."
-
-    # 3. Prevent DHCP Hostname Leakage in NetworkManager
-    log_info "Configuring NetworkManager DHCP hostname privacy..."
-    mkdir -p /etc/NetworkManager/conf.d
-    cat << 'EOF' > "$DHCP_PRIVACY_CONF"
-[connection]
-# Do not send machine hostname in DHCP requests
-ipv4.dhcp-send-hostname=false
-ipv6.dhcp-send-hostname=false
-EOF
-    chmod 644 "$DHCP_PRIVACY_CONF"
-    nmcli general reload 2>/dev/null || systemctl reload NetworkManager 2>/dev/null || true
-    log_success "DHCP hostname leak protection active."
-
-    # 4. Optional: Disable slow boot delays and background broadcast daemons
-    local disable_services=0
-    if [ "${FORCE_YES:-0}" -eq 1 ]; then
-        disable_services=0
-    elif [ -t 0 ]; then
-        echo ""
-        log_warn "Disabling avahi-daemon/cups-browsed disables mDNS discovery and breaks dynamically discovered (dnssd://) network printers."
-        read -r -p "Disable discovery background daemons (avahi-daemon, cups-browsed, ModemManager)? [y/N]: " daemon_ans
-        if [[ "$daemon_ans" =~ ^[Yy]$ ]]; then
-            disable_services=1
-        else
-            log_info "Keeping background discovery daemons active."
-        fi
+disable_swappiness() {
+    check_root "tune" "swappiness" "disable"
+    log_info "Restoring default memory swappiness values..."
+    local b_swap=60 b_vfs=100
+    if [ -f "$BASELINE_SYSCTL" ]; then
+        # shellcheck disable=SC1090
+        . "$BASELINE_SYSCTL"
+        b_swap="${BASE_SWAPPINESS:-60}"
+        b_vfs="${BASE_VFS_PRESSURE:-100}"
     fi
-
-    if [ "$disable_services" -eq 1 ]; then
-        log_info "Optimizing startup services and eliminating broadcast daemons..."
-        systemctl disable NetworkManager-wait-online.service 2>/dev/null && echo "  - Disabled NetworkManager-wait-online (~7s boot delay removed)." || true
-        systemctl stop avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
-        systemctl disable avahi-daemon.service avahi-daemon.socket 2>/dev/null && echo "  - Disabled avahi-daemon & avahi-daemon.socket (mDNS stopped)." || true
-        systemctl stop cups-browsed 2>/dev/null || true
-        systemctl disable cups-browsed 2>/dev/null && echo "  - Disabled cups-browsed (UDP 631 printer polling stopped)." || true
-        systemctl stop ModemManager 2>/dev/null || true
-        systemctl disable ModemManager 2>/dev/null && echo "  - Disabled ModemManager (cellular serial scanner stopped)." || true
+    sysctl -w vm.swappiness="$b_swap" >/dev/null 2>&1 || true
+    sysctl -w vm.vfs_cache_pressure="$b_vfs" >/dev/null 2>&1 || true
+    if [ -f "$PERF_SYSCTL" ]; then
+        sed -i '/^vm\.swappiness/d; /^vm\.vfs_cache_pressure/d' "$PERF_SYSCTL"
+        grep -qE '^[a-zA-Z]' "$PERF_SYSCTL" 2>/dev/null || rm -f "$PERF_SYSCTL"
     fi
+    log_success "Swappiness restored to baseline defaults (swappiness: $b_swap, vfs_pressure: $b_vfs)."
+}
 
-    # 5. ZRAM Compressed RAM Swap
+toggle_swappiness() {
+    check_root "tune" "swappiness" "toggle"
+    local cur_swap
+    cur_swap=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "60")
+    if [ "$cur_swap" -eq 100 ]; then
+        disable_swappiness
+    else
+        enable_swappiness
+    fi
+}
+
+# 4. ZRAM Compressed RAM Swap
+enable_zram() {
+    check_root "tune" "zram" "enable"
     log_info "Setting up ZRAM compressed RAM swap (zstd algorithm)..."
     if ! dpkg -l zram-tools &>/dev/null; then
         DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y zram-tools
@@ -1569,6 +1774,232 @@ EOF
     else
         log_warn "Failed to start zramswap.service; check systemctl status zramswap."
     fi
+}
+
+disable_zram() {
+    check_root "tune" "zram" "disable"
+    log_info "Disabling ZRAM compressed swap..."
+    systemctl stop zramswap.service 2>/dev/null || true
+    systemctl disable zramswap.service 2>/dev/null || true
+    swapoff /dev/zram* 2>/dev/null || true
+    command -v zramctl &>/dev/null && zramctl --reset /dev/zram* 2>/dev/null || true
+    rm -f "$ZRAM_CONF"
+    log_success "ZRAM swap deactivated and removed."
+}
+
+toggle_zram() {
+    check_root "tune" "zram" "toggle"
+    if swapon --show 2>/dev/null | grep -q "zram"; then
+        disable_zram
+    else
+        enable_zram
+    fi
+}
+
+# 5. Prevent DHCP Hostname Leakage
+enable_dhcp_privacy() {
+    check_root "tune" "dhcp" "enable"
+    log_info "Configuring NetworkManager DHCP hostname privacy across connections..."
+    rm -f "$DHCP_PRIVACY_CONF"
+    mkdir -p /var/lib/mint-admin
+    touch /var/lib/mint-admin/dhcp-privacy-enabled
+
+    if command -v nmcli &>/dev/null; then
+        while IFS= read -r uuid; do
+            [ -n "$uuid" ] || continue
+            nmcli con modify "$uuid" ipv4.dhcp-send-hostname no ipv6.dhcp-send-hostname no 2>/dev/null || true
+        done < <(nmcli -t -f UUID connection show 2>/dev/null)
+        nmcli general reload 2>/dev/null || true
+    fi
+    log_success "DHCP hostname leak protection active (hostname hidden from Wi-Fi routers)."
+}
+
+disable_dhcp_privacy() {
+    check_root "tune" "dhcp" "disable"
+    log_info "Disabling DHCP hostname leak protection..."
+    rm -f "$DHCP_PRIVACY_CONF" /var/lib/mint-admin/dhcp-privacy-enabled
+
+    if command -v nmcli &>/dev/null; then
+        while IFS= read -r uuid; do
+            [ -n "$uuid" ] || continue
+            nmcli con modify "$uuid" ipv4.dhcp-send-hostname yes ipv6.dhcp-send-hostname yes 2>/dev/null || true
+        done < <(nmcli -t -f UUID connection show 2>/dev/null)
+        nmcli general reload 2>/dev/null || true
+    fi
+    log_success "DHCP hostname leak protection disabled (hostname will be sent in DHCP requests)."
+}
+
+toggle_dhcp_privacy() {
+    check_root "tune" "dhcp" "toggle"
+    if [ "$(status_get_dhcp)" = "BLOCKED (Protected)" ]; then
+        disable_dhcp_privacy
+    else
+        enable_dhcp_privacy
+    fi
+}
+
+# 6. Kernel Memory Privacy Hardening
+enable_kernel_hardening() {
+    check_root "tune" "kernel" "enable"
+    save_tuning_baseline
+    log_info "Configuring kernel privacy & memory protection sysctls..."
+    mkdir -p /etc/sysctl.d
+    cat << 'EOF' > "$PRIVACY_SYSCTL"
+# Kernel Privacy & Security Hardening (mint-admin)
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 2
+kernel.unprivileged_bpf_disabled = 1
+fs.suid_dumpable = 0
+EOF
+    sysctl -p "$PRIVACY_SYSCTL" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+    log_success "Kernel privacy hardened (dmesg & kptr restricted to root)."
+}
+
+disable_kernel_hardening() {
+    check_root "tune" "kernel" "disable"
+    log_info "Restoring default kernel privacy sysctls..."
+    rm -f "$PRIVACY_SYSCTL"
+    local b_suid=2 b_bpf=2 b_dmesg=0 b_kptr=1
+    if [ -f "$BASELINE_SYSCTL" ]; then
+        # shellcheck disable=SC1090
+        . "$BASELINE_SYSCTL"
+        b_suid="${BASE_SUID_DUMPABLE:-2}"
+        b_bpf="${BASE_BPF_DISABLED:-2}"
+        b_dmesg="${BASE_DMESG_RESTRICT:-0}"
+        b_kptr="${BASE_KPTR_RESTRICT:-1}"
+    fi
+    sysctl -w kernel.dmesg_restrict="$b_dmesg" >/dev/null 2>&1 || true
+    sysctl -w kernel.kptr_restrict="$b_kptr" >/dev/null 2>&1 || true
+    sysctl -w kernel.unprivileged_bpf_disabled="$b_bpf" >/dev/null 2>&1 || true
+    sysctl -w fs.suid_dumpable="$b_suid" >/dev/null 2>&1 || true
+    log_success "Kernel memory privacy restored to default permissive values."
+}
+
+toggle_kernel_hardening() {
+    check_root "tune" "kernel" "toggle"
+    local dmesg_r kptr_r
+    dmesg_r=$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null || echo "0")
+    kptr_r=$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null || echo "0")
+    if [ "$dmesg_r" -ge 1 ] && [ "$kptr_r" -ge 1 ]; then
+        disable_kernel_hardening
+    else
+        enable_kernel_hardening
+    fi
+}
+
+# 7. Background Discovery Daemons
+toggle_avahi() {
+    check_root "tune" "avahi" "toggle"
+    if systemctl is-active --quiet avahi-daemon 2>/dev/null || systemctl is-enabled --quiet avahi-daemon 2>/dev/null; then
+        log_info "Disabling avahi-daemon (mDNS broadcast)..."
+        systemctl stop avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
+        systemctl disable avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
+        log_success "Avahi mDNS daemon stopped & disabled."
+    else
+        log_info "Enabling avahi-daemon (mDNS broadcast)..."
+        systemctl unmask avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
+        systemctl enable --now avahi-daemon.socket avahi-daemon.service 2>/dev/null || true
+        log_success "Avahi mDNS daemon enabled & started."
+    fi
+}
+
+toggle_cups_browsed() {
+    check_root "tune" "cups" "toggle"
+    if systemctl is-active --quiet cups-browsed 2>/dev/null || systemctl is-enabled --quiet cups-browsed 2>/dev/null; then
+        log_info "Disabling cups-browsed (UDP 631 printer polling)..."
+        systemctl stop cups-browsed 2>/dev/null || true
+        systemctl disable cups-browsed 2>/dev/null || true
+        log_success "CUPS network browsing stopped & disabled."
+    else
+        log_info "Enabling cups-browsed..."
+        systemctl unmask cups-browsed 2>/dev/null || true
+        systemctl enable --now cups-browsed 2>/dev/null || true
+        log_success "CUPS network browsing enabled & started."
+    fi
+}
+
+toggle_modemmanager() {
+    check_root "tune" "modem" "toggle"
+    if systemctl is-active --quiet ModemManager 2>/dev/null || systemctl is-enabled --quiet ModemManager 2>/dev/null; then
+        log_info "Disabling ModemManager (cellular serial scanner)..."
+        systemctl stop ModemManager 2>/dev/null || true
+        systemctl disable ModemManager 2>/dev/null || true
+        log_success "ModemManager stopped & disabled."
+    else
+        log_info "Enabling ModemManager..."
+        systemctl unmask ModemManager 2>/dev/null || true
+        systemctl enable --now ModemManager 2>/dev/null || true
+        log_success "ModemManager enabled & started."
+    fi
+}
+
+toggle_broadcast_daemons() {
+    check_root "tune" "daemons" "toggle"
+    if systemctl is-active --quiet avahi-daemon 2>/dev/null || systemctl is-active --quiet cups-browsed 2>/dev/null || systemctl is-active --quiet ModemManager 2>/dev/null; then
+        log_info "Stopping & disabling all background discovery daemons..."
+        systemctl stop avahi-daemon.service avahi-daemon.socket cups-browsed ModemManager 2>/dev/null || true
+        systemctl disable avahi-daemon.service avahi-daemon.socket cups-browsed ModemManager 2>/dev/null || true
+        log_success "All discovery broadcast daemons disabled (Avahi, CUPS, ModemManager)."
+    else
+        log_info "Enabling & starting discovery broadcast daemons..."
+        systemctl unmask avahi-daemon.service avahi-daemon.socket cups-browsed ModemManager 2>/dev/null || true
+        systemctl enable --now avahi-daemon.socket avahi-daemon.service 2>/dev/null || true
+        systemctl enable --now cups-browsed 2>/dev/null || true
+        systemctl enable --now ModemManager 2>/dev/null || true
+        log_success "Discovery broadcast daemons enabled & active."
+    fi
+}
+
+apply_system_tuning() {
+    check_root "tune" "apply"
+
+    echo -e "${CYAN}========================================================${NC}"
+    echo -e "${BOLD}     Applying Performance & Privacy System Tuning${NC}"
+    echo -e "${CYAN}========================================================${NC}"
+
+    # Capture initial baseline values before first modification
+    save_tuning_baseline
+
+    # 1. Enable Google BBR and Performance sysctls
+    enable_bbr
+
+    # 2. Memory & Swappiness Optimization
+    enable_swappiness
+
+    # 3. Kernel Privacy & Anti-Leak Sysctls
+    enable_kernel_hardening
+
+    # 4. Prevent DHCP Hostname Leakage in NetworkManager
+    enable_dhcp_privacy
+
+    # 5. Optional: Disable slow boot delays and background broadcast daemons
+    local disable_services=0
+    if [ "${FORCE_YES:-0}" -eq 1 ]; then
+        disable_services=0
+    elif [ -t 0 ]; then
+        echo ""
+        log_warn "Disabling avahi-daemon/cups-browsed disables mDNS discovery and breaks dynamically discovered (dnssd://) network printers."
+        read -r -p "Disable discovery background daemons (avahi-daemon, cups-browsed, ModemManager)? [y/N]: " daemon_ans
+        if [[ "$daemon_ans" =~ ^[Yy]$ ]]; then
+            disable_services=1
+        else
+            log_info "Keeping background discovery daemons active."
+        fi
+    fi
+
+    if [ "$disable_services" -eq 1 ]; then
+        log_info "Optimizing startup services and eliminating broadcast daemons..."
+        disable_nm_wait_online
+        systemctl stop avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
+        systemctl disable avahi-daemon.service avahi-daemon.socket 2>/dev/null && echo "  - Disabled avahi-daemon & avahi-daemon.socket (mDNS stopped)." || true
+        systemctl stop cups-browsed 2>/dev/null || true
+        systemctl disable cups-browsed 2>/dev/null && echo "  - Disabled cups-browsed (UDP 631 printer polling stopped)." || true
+        systemctl stop ModemManager 2>/dev/null || true
+        systemctl disable ModemManager 2>/dev/null && echo "  - Disabled ModemManager (cellular serial scanner stopped)." || true
+    fi
+
+    # 6. ZRAM Compressed RAM Swap
+    enable_zram
 
     echo ""
     log_success "All system performance and privacy tunings applied successfully!"
@@ -1579,48 +2010,53 @@ revert_system_tuning() {
     check_root "tune" "revert"
 
     log_warn "Reverting performance & privacy tunings to Linux Mint defaults..."
-    rm -f "$PERF_SYSCTL" "$PRIVACY_SYSCTL" "$BBR_MODULE_CONF" "$DHCP_PRIVACY_CONF"
+    disable_bbr
+    disable_swappiness
+    disable_kernel_hardening
+    disable_dhcp_privacy
 
-    # Restore from baseline if available, otherwise safe defaults
-    local b_suid=2 b_bpf=2 b_fastopen=1 b_swap=60 b_vfs=100 b_dmesg=0 b_kptr=1 b_cc=cubic b_qdisc=fq_codel
+    local b_avahi=0 b_cups=0 b_modem=0 b_wait=1
     if [ -f "$BASELINE_SYSCTL" ]; then
         # shellcheck disable=SC1090
         . "$BASELINE_SYSCTL"
-        b_suid="${BASE_SUID_DUMPABLE:-2}"
-        b_bpf="${BASE_BPF_DISABLED:-2}"
-        b_fastopen="${BASE_FASTOPEN:-1}"
-        b_swap="${BASE_SWAPPINESS:-60}"
-        b_vfs="${BASE_VFS_PRESSURE:-100}"
-        b_dmesg="${BASE_DMESG_RESTRICT:-0}"
-        b_kptr="${BASE_KPTR_RESTRICT:-1}"
-        b_cc="${BASE_TCP_CC:-cubic}"
-        b_qdisc="${BASE_QDISC:-fq_codel}"
-        rm -f "$BASELINE_SYSCTL"
+        b_avahi="${BASE_AVAHI_ACTIVE:-0}"
+        b_cups="${BASE_CUPS_ACTIVE:-0}"
+        b_modem="${BASE_MODEM_ACTIVE:-0}"
+        b_wait="${BASE_NM_WAIT_ACTIVE:-1}"
     fi
 
-    # Reset kernel sysctls to defaults
-    sysctl -w net.ipv4.tcp_congestion_control="$b_cc" >/dev/null 2>&1 || true
-    sysctl -w net.core.default_qdisc="$b_qdisc" >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_fastopen="$b_fastopen" >/dev/null 2>&1 || true
-    sysctl -w vm.swappiness="$b_swap" >/dev/null 2>&1 || true
-    sysctl -w vm.vfs_cache_pressure="$b_vfs" >/dev/null 2>&1 || true
-    sysctl -w kernel.dmesg_restrict="$b_dmesg" >/dev/null 2>&1 || true
-    sysctl -w kernel.kptr_restrict="$b_kptr" >/dev/null 2>&1 || true
-    sysctl -w kernel.unprivileged_bpf_disabled="$b_bpf" >/dev/null 2>&1 || true
-    sysctl -w fs.suid_dumpable="$b_suid" >/dev/null 2>&1 || true
+    if [ "$b_wait" -eq 1 ]; then
+        enable_nm_wait_online
+    else
+        disable_nm_wait_online
+    fi
 
-    # Re-enable services
-    systemctl enable NetworkManager-wait-online.service 2>/dev/null || true
-    systemctl enable --now avahi-daemon.socket avahi-daemon.service 2>/dev/null || true
-    systemctl enable --now cups-browsed 2>/dev/null || true
-    systemctl enable --now ModemManager 2>/dev/null || true
+    if [ "$b_avahi" -eq 1 ]; then
+        systemctl unmask avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
+        systemctl enable --now avahi-daemon.socket avahi-daemon.service 2>/dev/null || true
+    else
+        systemctl stop avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
+        systemctl disable avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
+    fi
 
-    # Disable ZRAM, swap off active zram devices, and remove config if user reverts
-    systemctl stop zramswap.service 2>/dev/null || true
-    systemctl disable zramswap.service 2>/dev/null || true
-    swapoff /dev/zram* 2>/dev/null || true
-    command -v zramctl &>/dev/null && zramctl --reset /dev/zram* 2>/dev/null || true
-    rm -f "$ZRAM_CONF"
+    if [ "$b_cups" -eq 1 ]; then
+        systemctl unmask cups-browsed 2>/dev/null || true
+        systemctl enable --now cups-browsed 2>/dev/null || true
+    else
+        systemctl stop cups-browsed 2>/dev/null || true
+        systemctl disable cups-browsed 2>/dev/null || true
+    fi
+
+    if [ "$b_modem" -eq 1 ]; then
+        systemctl unmask ModemManager 2>/dev/null || true
+        systemctl enable --now ModemManager 2>/dev/null || true
+    else
+        systemctl stop ModemManager 2>/dev/null || true
+        systemctl disable ModemManager 2>/dev/null || true
+    fi
+
+    disable_zram
+    rm -f "$BASELINE_SYSCTL"
 
     nmcli general reload 2>/dev/null || systemctl reload NetworkManager 2>/dev/null || true
     log_success "System settings reverted to baseline defaults."
@@ -1951,6 +2387,83 @@ status_get_ipv6() {
     fi
 }
 
+status_get_wait_online() {
+    if systemctl is-enabled --quiet NetworkManager-wait-online.service 2>/dev/null; then
+        echo "ENABLED (~7s boot delay)"
+    else
+        echo "DISABLED (Fast boot)"
+    fi
+}
+
+status_get_swappiness() {
+    local sw vfs
+    sw=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "60")
+    vfs=$(cat /proc/sys/vm/vfs_cache_pressure 2>/dev/null || echo "100")
+    if [ "$sw" -eq 100 ]; then
+        echo "100/50 (Optimized for ZRAM)"
+    else
+        echo "${sw}/${vfs} (Default)"
+    fi
+}
+
+status_get_dhcp() {
+    if command -v nmcli &>/dev/null; then
+        local active_uuid
+        active_uuid=$(nmcli -t -f UUID,TYPE connection show --active 2>/dev/null | grep -E ':(802-11-wireless|802-3-ethernet)' | head -n1 | cut -d: -f1 || true)
+        if [ -n "$active_uuid" ]; then
+            local send_host
+            send_host=$(nmcli -g ipv4.dhcp-send-hostname connection show "$active_uuid" 2>/dev/null || echo "yes")
+            if [ "$send_host" = "no" ] || [ "$send_host" = "0" ] || [ "$send_host" = "false" ]; then
+                echo "BLOCKED (Protected)"
+                return
+            else
+                echo "EXPOSED (Leaking)"
+                return
+            fi
+        fi
+    fi
+    if [ -f /var/lib/mint-admin/dhcp-privacy-enabled ]; then
+        echo "BLOCKED (Protected)"
+    else
+        echo "EXPOSED (Leaking)"
+    fi
+}
+
+status_get_kernel_privacy() {
+    local dmesg_r kptr_r
+    dmesg_r=$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null || echo "0")
+    kptr_r=$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null || echo "0")
+    if [ "$dmesg_r" -ge 1 ] && [ "$kptr_r" -ge 1 ]; then
+        echo "HARDENED (Root only)"
+    else
+        echo "PERMISSIVE (Default)"
+    fi
+}
+
+status_get_avahi() {
+    if systemctl is-active --quiet avahi-daemon 2>/dev/null; then
+        echo "ACTIVE (mDNS)"
+    else
+        echo "DISABLED"
+    fi
+}
+
+status_get_cups() {
+    if systemctl is-active --quiet cups-browsed 2>/dev/null; then
+        echo "ACTIVE (UDP 631)"
+    else
+        echo "DISABLED"
+    fi
+}
+
+status_get_modem() {
+    if systemctl is-active --quiet ModemManager 2>/dev/null; then
+        echo "ACTIVE"
+    else
+        echo "DISABLED"
+    fi
+}
+
 check_pending_updates() {
     local count=0
     if [ -x "/usr/lib/update-notifier/apt-check" ]; then
@@ -2105,20 +2618,33 @@ show_maintenance_advisory() {
 FIRST_PROMPT_DONE=0
 
 run_menu_action() {
-    set +e
-    "$@"
-    local rc=$?
-    set -e
+    local rc=0
+    ( "$@" ) || rc=$?
     if [ $rc -ne 0 ]; then
         echo ""
         log_warn "Action finished with exit code $rc."
     fi
     echo ""
-    read -rp "Press Enter to return to Dashboard..." _ || true
+    if [ -t 0 ]; then
+        read -rp "Press Enter to return to Dashboard..." _ || true
+    fi
+}
+
+run_whiptail_action() {
+    local rc=0
+    ( "$@" ) || rc=$?
+    if [ $rc -ne 0 ]; then
+        echo ""
+        log_warn "Action finished with exit code $rc."
+    fi
+    echo ""
+    if [ -t 0 ]; then
+        read -rp "Press Enter to return..." _ || true
+    fi
 }
 
 show_system_summary() {
-    local cur_preset cur_bat cur_zram cur_bbr cur_dns cur_mac cur_timer cur_ipv6
+    local cur_preset cur_bat cur_zram cur_bbr cur_dns cur_mac cur_timer cur_ipv6 cur_nm
     cur_preset=$(status_get_preset)
     cur_bat=$(status_get_battery)
     cur_zram=$(status_get_zram)
@@ -2127,39 +2653,183 @@ show_system_summary() {
     cur_mac=$(status_get_mac)
     cur_timer=$(status_get_timer)
     cur_ipv6=$(status_get_ipv6)
+    cur_nm=$(status_get_wait_online)
 
     local updates="${1:-}"
     local cleanable_kb="${2:-}"
     [ -z "$updates" ] && updates=$(check_pending_updates)
     [ -z "$cleanable_kb" ] && cleanable_kb=$(check_cleanable_cache)
 
-    echo -e "${CYAN}================================================================================${NC}"
-    echo -e "  ${BOLD}${GREEN}⚡ Laptop Linux Optimizer — Comprehensive System Status Summary${NC}"
-    echo -e "${CYAN}================================================================================${NC}"
-    echo -e "  ${BOLD}[ HARDWARE & PERFORMANCE ]${NC}"
-    echo -e "  • Active Profile Preset: ${GREEN}${BOLD}${cur_preset}${NC}"
-    echo -e "  • Battery Diagnostics  : ${CYAN}${cur_bat}${NC}"
-    echo -e "  • ZRAM Compressed Swap : ${GREEN}${cur_zram}${NC}"
-    echo -e "  • TCP Congestion (BBR) : ${GREEN}${cur_bbr}${NC}"
-    echo ""
-    echo -e "  ${BOLD}[ SECURITY & NETWORK PRIVACY ]${NC}"
-    echo -e "  • Encrypted DNS Status : ${BLUE}${cur_dns}${NC}"
-    echo -e "  • Network MAC Address  : ${MAGENTA}${cur_mac}${NC}"
-    echo -e "  • IPv6 Protocol State  : ${cur_ipv6}"
-    echo -e "  • Automated Background : ${cur_timer}"
-    echo ""
-    echo -e "  ${BOLD}[ MAINTENANCE & STORAGE ADVISORY ]${NC}"
+    echo -e "${CYAN}┌──────────────────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC}  ${BOLD}${GREEN}⚡ Laptop Linux Optimizer — Comprehensive System Status Summary${NC}             ${CYAN}│${NC}"
+    echo -e "${CYAN}├──────────────────────────────────────────────────────────────────────────────┤${NC}"
+    echo -e "${CYAN}│${NC}  ${BOLD}[ HARDWARE & PERFORMANCE ]${NC}"
+    echo -e "${CYAN}│${NC}  • Active Profile Preset: ${GREEN}${BOLD}${cur_preset}${NC}"
+    echo -e "${CYAN}│${NC}  • Battery Diagnostics  : ${CYAN}${cur_bat}${NC}"
+    echo -e "${CYAN}│${NC}  • ZRAM Compressed Swap : ${GREEN}${cur_zram}${NC}"
+    echo -e "${CYAN}│${NC}  • TCP Congestion (BBR) : ${GREEN}${cur_bbr}${NC}"
+    echo -e "${CYAN}│${NC}  • NM Boot Speed Delay  : ${GREEN}${cur_nm}${NC}"
+    echo -e "${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}  ${BOLD}[ SECURITY & NETWORK PRIVACY ]${NC}"
+    echo -e "${CYAN}│${NC}  • Encrypted DNS Status : ${BLUE}${cur_dns}${NC}"
+    echo -e "${CYAN}│${NC}  • Network MAC Address  : ${MAGENTA}${cur_mac}${NC}"
+    echo -e "${CYAN}│${NC}  • IPv6 Protocol State  : ${cur_ipv6}"
+    echo -e "${CYAN}│${NC}  • Automated Background : ${cur_timer}"
+    echo -e "${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}  ${BOLD}[ MAINTENANCE & STORAGE ADVISORY ]${NC}"
     if [ "$updates" -gt 0 ]; then
-        echo -e "  • Package Updates      : ${YELLOW}${BOLD}${updates} package update(s) ready to install${NC}"
+        echo -e "${CYAN}│${NC}  • Package Updates      : ${YELLOW}${BOLD}${updates} package update(s) ready to install${NC}"
     else
-        echo -e "  • Package Updates      : ${GREEN}All packages up to date${NC}"
+        echo -e "${CYAN}│${NC}  • Package Updates      : ${GREEN}All packages up to date${NC}"
     fi
     if [ "$cleanable_kb" -gt 50000 ]; then
-        echo -e "  • Cleanable Storage    : ${YELLOW}${BOLD}~$(format_kb "$cleanable_kb")${NC} in cleanable caches & logs"
+        echo -e "${CYAN}│${NC}  • Cleanable Storage    : ${YELLOW}${BOLD}~$(format_kb "$cleanable_kb")${NC} in cleanable caches & logs"
     else
-        echo -e "  • Cleanable Storage    : ${GREEN}System storage is lean (~$(format_kb "$cleanable_kb"))${NC}"
+        echo -e "${CYAN}│${NC}  • Cleanable Storage    : ${GREEN}System storage is lean (~$(format_kb "$cleanable_kb"))${NC}"
     fi
-    echo -e "${CYAN}================================================================================${NC}"
+    echo -e "${CYAN}└──────────────────────────────────────────────────────────────────────────────┘${NC}"
+}
+
+# ------------------------------------------------------------------------------
+# Whiptail / Dialog Curses Submenus
+# ------------------------------------------------------------------------------
+
+whiptail_battery_menu() {
+    local tui_cmd="$1"
+    while true; do
+        local b_info
+        b_info=$(status_get_battery)
+        local bchoice
+        bchoice=$($tui_cmd --title "Battery Diagnostics & Limiter Configuration" \
+            --menu "Current: $b_info\nSelect battery action:" 16 70 5 \
+            "1" "View Detailed Battery Health & Diagnostics" \
+            "2" "Set Charge Limit (e.g. 60%, 80%, 100%)" \
+            "3" "Install Persistent Charge Limiter Service" \
+            "4" "Uninstall Limiter Service (Restore 100%)" \
+            "Q" "Return to Main Menu" \
+            3>&1 1>&2 2>&3 || echo "Q")
+
+        case "$bchoice" in
+            1) show_battery_status; read -rp "Press Enter to return..." _ ;;
+            2)
+                local bval
+                bval=$($tui_cmd --title "Set Charge Limit" --inputbox "Enter target percentage [20-100]:" 10 60 "80" 3>&1 1>&2 2>&3 || echo "")
+                if [ -n "$bval" ]; then
+                    run_whiptail_action set_battery_threshold "$bval"
+                fi
+                ;;
+            3)
+                local bval
+                bval=$($tui_cmd --title "Install Limiter Service" --inputbox "Enter persistent target limit [20-100]:" 10 60 "80" 3>&1 1>&2 2>&3 || echo "")
+                if [ -n "$bval" ]; then
+                    run_whiptail_action install_battery_service "$bval"
+                fi
+                ;;
+            4)
+                run_whiptail_action uninstall_battery_service
+                ;;
+            Q|"") break ;;
+        esac
+    done
+}
+
+whiptail_mac_menu() {
+    local tui_cmd="$1"
+    while true; do
+        local m_info
+        m_info=$(status_get_mac)
+        local mchoice
+        mchoice=$($tui_cmd --title "Network MAC Randomization & Spoofing" \
+            --menu "Current State: $m_info\nSelect MAC action:" 16 70 5 \
+            "1" "View Physical Interfaces & Current MACs" \
+            "2" "Randomize MAC Addresses Now (Instant Spoof)" \
+            "3" "Enable Persistent NetworkManager Randomization" \
+            "4" "Disable Persistent Auto-Randomization" \
+            "Q" "Return to Main Menu" \
+            3>&1 1>&2 2>&3 || echo "Q")
+
+        case "$mchoice" in
+            1) show_mac_status; read -rp "Press Enter to return..." _ ;;
+            2) run_whiptail_action randomize_mac ;;
+            3) run_whiptail_action enable_mac_randomization ;;
+            4) run_whiptail_action disable_mac_randomization ;;
+            Q|"") break ;;
+        esac
+    done
+}
+
+whiptail_timer_menu() {
+    local tui_cmd="$1"
+    while true; do
+        local tm_info
+        tm_info=$(status_get_timer)
+        local tmchoice
+        tmchoice=$($tui_cmd --title "Automated Weekly Maintenance Timer" \
+            --menu "Timer State: $tm_info\nSelect timer action:" 15 70 4 \
+            "1" "View Timer Status & Recent Run Logs" \
+            "2" "Install / Enable Weekly Timer (Sun 03:00)" \
+            "3" "Uninstall / Disable Weekly Timer" \
+            "Q" "Return to Main Menu" \
+            3>&1 1>&2 2>&3 || echo "Q")
+
+        case "$tmchoice" in
+            1) show_timer_status; read -rp "Press Enter to return..." _ ;;
+            2) run_whiptail_action install_weekly_timer ;;
+            3) run_whiptail_action uninstall_weekly_timer ;;
+            Q|"") break ;;
+        esac
+    done
+}
+
+whiptail_tuning_menu() {
+    local tui_cmd="$1"
+    while true; do
+        local cur_nm cur_bbr cur_swap cur_zram cur_dhcp cur_kern cur_avahi cur_cups cur_modem
+        cur_nm=$(status_get_wait_online)
+        cur_bbr=$(status_get_bbr)
+        cur_swap=$(status_get_swappiness)
+        cur_zram=$(status_get_zram)
+        cur_dhcp=$(status_get_dhcp)
+        cur_kern=$(status_get_kernel_privacy)
+        cur_avahi=$(status_get_avahi)
+        cur_cups=$(status_get_cups)
+        cur_modem=$(status_get_modem)
+
+        local tchoice
+        tchoice=$($tui_cmd --title "Performance, Privacy & Startup Toggles" \
+            --menu "Select an option to toggle or configure:" 24 78 13 \
+            "1" "NM Wait-Online Delay   [$cur_nm]" \
+            "2" "TCP Congestion Control  [$cur_bbr]" \
+            "3" "Swappiness & VFS Cache  [$cur_swap]" \
+            "4" "ZRAM Compressed Swap    [$cur_zram]" \
+            "5" "DHCP Hostname Leak      [$cur_dhcp]" \
+            "6" "Kernel Memory Privacy   [$cur_kern]" \
+            "7" "Avahi mDNS Daemon       [$cur_avahi]" \
+            "8" "CUPS Network Polling    [$cur_cups]" \
+            "9" "ModemManager Daemon     [$cur_modem]" \
+            "B" "Toggle All 3 Broadcast Daemons" \
+            "A" "Apply All Performance & Privacy Tunings" \
+            "R" "Revert All Tunings to System Baseline" \
+            "S" "Display Full Status Report" \
+            3>&1 1>&2 2>&3 || echo "Q")
+
+        case "$tchoice" in
+            1) run_whiptail_action toggle_nm_wait_online ;;
+            2) run_whiptail_action toggle_bbr ;;
+            3) run_whiptail_action toggle_swappiness ;;
+            4) run_whiptail_action toggle_zram ;;
+            5) run_whiptail_action toggle_dhcp_privacy ;;
+            6) run_whiptail_action toggle_kernel_hardening ;;
+            7) run_whiptail_action toggle_avahi ;;
+            8) run_whiptail_action toggle_cups_browsed ;;
+            9) run_whiptail_action toggle_modemmanager ;;
+            B) run_whiptail_action toggle_broadcast_daemons ;;
+            A) run_whiptail_action apply_system_tuning ;;
+            R) run_whiptail_action revert_system_tuning ;;
+            S) show_tuning_status; read -rp "Press Enter to continue..." _ ;;
+            Q|"") break ;;
+        esac
+    done
 }
 
 show_whiptail_tui() {
@@ -2174,15 +2844,16 @@ show_whiptail_tui() {
     fi
 
     while true; do
-        local p_info b_info z_info bbr_info
+        local p_info b_info z_info bbr_info nm_info
         p_info=$(status_get_preset)
         b_info=$(status_get_battery)
         z_info=$(status_get_zram)
         bbr_info=$(status_get_bbr)
+        nm_info=$(status_get_wait_online)
 
         local choice
         choice=$($tui_cmd --title "Laptop Linux Optimizer & Admin Suite (v$VERSION)" \
-            --backtitle "Preset: $p_info | Battery: $b_info | ZRAM: $z_info | CC: $bbr_info" \
+            --backtitle "Preset: $p_info | Bat: $b_info | ZRAM: $z_info | BBR: $bbr_info | NM Boot: $nm_info" \
             --menu "Select a subsystem or management action below:" 22 78 13 \
             "P"  "Switch Profile Preset (Desk / Balanced / Travel)" \
             "1"  "Guided Laptop Optimization Wizard (5-Step Setup)" \
@@ -2191,42 +2862,205 @@ show_whiptail_tui() {
             "4"  "Battery Diagnostics & Charge Limiter Configuration" \
             "5"  "Encrypted DNS Manager (DoH / Relays / Tor)" \
             "6"  "Network MAC Randomization & Spoofing" \
-            "7"  "Performance & Kernel Tuning (BBR, ZRAM, Swappiness)" \
+            "7"  "Performance, Privacy & Startup Toggles (NM Boot, BBR, ZRAM)" \
             "8"  "Privacy & Anti-Tracking Activity Scrub" \
             "9"  "Automated Weekly Maintenance Timer" \
             "10" "Toggle IPv6 Protocol (Enable / Disable)" \
             "11" "Complete Master Suite (All-In-One)" \
-            "A"  "Switch to ANSI Terminal Dashboard" \
+            "A"  "Switch to Curses / Ink Terminal Dashboard" \
             3>&1 1>&2 2>&3 || echo "Q")
 
         case "$choice" in
             P) interactive_preset_menu ;;
-            1) run_guided_wizard ;;
-            2) update_and_clean; read -rp "Press Enter..." ;;
-            3) run_optimizer; read -rp "Press Enter..." ;;
-            4) show_battery_status; read -rp "Press Enter..." ;;
+            1) run_whiptail_action run_guided_wizard ;;
+            2) run_whiptail_action update_and_clean ;;
+            3) run_whiptail_action run_optimizer ;;
+            4) whiptail_battery_menu "$tui_cmd" ;;
             5) interactive_dns_menu ;;
-            6) show_mac_status; read -rp "Press Enter..." ;;
-            7) show_tuning_status; read -rp "Press Enter..." ;;
-            8) clean_privacy "privacy"; read -rp "Press Enter..." ;;
-            9) show_timer_status; read -rp "Press Enter..." ;;
+            6) whiptail_mac_menu "$tui_cmd" ;;
+            7) whiptail_tuning_menu "$tui_cmd" ;;
+            8) run_whiptail_action clean_privacy "privacy" ;;
+            9) whiptail_timer_menu "$tui_cmd" ;;
             10)
                 local cur_st="ENABLED"
                 [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" -eq 1 ] && cur_st="DISABLED"
                 local next_st="DISABLE"
                 [ "$cur_st" = "DISABLED" ] && next_st="ENABLE"
                 if $tui_cmd --title "IPv6 Protocol Toggle" --yesno "Current IPv6 State: $cur_st\n\nWould you like to toggle IPv6 ($next_st system-wide)?" 10 65; then
-                    toggle_ipv6
-                    read -rp "Press Enter to continue..." _
+                    run_whiptail_action toggle_ipv6
                 fi
                 ;;
-            11) run_complete_suite; read -rp "Press Enter..." ;;
+            11) run_whiptail_action run_complete_suite ;;
             A|Q|"") break ;;
         esac
     done
 }
 
+# ------------------------------------------------------------------------------
+# Interactive Subsystem Ink / Curses Menus
+# ------------------------------------------------------------------------------
+
+interactive_battery_menu() {
+    while true; do
+        clear 2>/dev/null || true
+        echo -e "${CYAN}╭──────────────────────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}${GREEN}🔋 BATTERY LIFESPAN & CHARGE LIMITER CONTROLS${NC}                               ${CYAN}│${NC}"
+        echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────────────────╯${NC}"
+        show_battery_status
+        echo -e "${CYAN}┌── BATTERY MANAGEMENT ACTIONS ────────────────────────────────────────────────┐${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[1]${NC} Set Session Charge Threshold  (e.g. 60%, 80%, 100%)"
+        echo -e "${CYAN}│${NC}  ${BOLD}[2]${NC} Install Persistent Limiter    (Persists across reboot & sleep)"
+        echo -e "${CYAN}│${NC}  ${BOLD}[3]${NC} Uninstall Limiter Service     (Restore full 100% capacity)"
+        echo -e "${CYAN}│${NC}  ${BOLD}[0/Q]${NC} Return to Master Dashboard"
+        echo -e "${CYAN}└──────────────────────────────────────────────────────────────────────────────┘${NC}"
+        read -rp "Select an option [1-3, Q]: " bopt
+        case "$bopt" in
+            1)
+                read -rp "Enter target percentage [20-100, default 80]: " bval
+                bval="${bval:-80}"
+                run_menu_action set_battery_threshold "$bval"
+                ;;
+            2)
+                read -rp "Enter target persistent limit [20-100, default 80]: " bval
+                bval="${bval:-80}"
+                run_menu_action install_battery_service "$bval"
+                ;;
+            3)
+                run_menu_action uninstall_battery_service
+                ;;
+            0|[Qq]|return|"") break ;;
+            *) log_warn "Invalid selection."; sleep 1 ;;
+        esac
+    done
+}
+
+interactive_mac_menu() {
+    while true; do
+        clear 2>/dev/null || true
+        echo -e "${CYAN}╭──────────────────────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}${MAGENTA}🕵️  NETWORK MAC RANDOMIZATION & HARDWARE PRIVACY${NC}                            ${CYAN}│${NC}"
+        echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────────────────╯${NC}"
+        show_mac_status
+        echo -e "${CYAN}┌── MAC ADDRESS ACTIONS ───────────────────────────────────────────────────────┐${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[1]${NC} Randomize MAC Addresses Now  (Instant spoof on active interfaces)"
+        echo -e "${CYAN}│${NC}  ${BOLD}[2]${NC} Enable Persistent Randomizer (NetworkManager auto-spoof on connect)"
+        echo -e "${CYAN}│${NC}  ${BOLD}[3]${NC} Disable Persistent Spoofing  (Restore permanent hardware MAC)"
+        echo -e "${CYAN}│${NC}  ${BOLD}[0/Q]${NC} Return to Master Dashboard"
+        echo -e "${CYAN}└──────────────────────────────────────────────────────────────────────────────┘${NC}"
+        read -rp "Select an option [1-3, Q]: " mopt
+        case "$mopt" in
+            1) run_menu_action randomize_mac ;;
+            2) run_menu_action enable_mac_randomization ;;
+            3) run_menu_action disable_mac_randomization ;;
+            0|[Qq]|return|"") break ;;
+            *) log_warn "Invalid selection."; sleep 1 ;;
+        esac
+    done
+}
+
+interactive_timer_menu() {
+    while true; do
+        clear 2>/dev/null || true
+        echo -e "${CYAN}╭──────────────────────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}${BLUE}⏱️  AUTOMATED WEEKLY BACKGROUND MAINTENANCE TIMER${NC}                            ${CYAN}│${NC}"
+        echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────────────────╯${NC}"
+        show_timer_status
+        echo -e "${CYAN}┌── TIMER CONTROLS ────────────────────────────────────────────────────────────┐${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[1]${NC} Install / Enable Weekly Maintenance Timer  (Runs Sundays at 03:00 AM)"
+        echo -e "${CYAN}│${NC}  ${BOLD}[2]${NC} Uninstall / Disable Weekly Timer           (Remove systemd schedule)"
+        echo -e "${CYAN}│${NC}  ${BOLD}[0/Q]${NC} Return to Master Dashboard"
+        echo -e "${CYAN}└──────────────────────────────────────────────────────────────────────────────┘${NC}"
+        read -rp "Select an option [1-2, Q]: " tmopt
+        case "$tmopt" in
+            1) run_menu_action install_weekly_timer ;;
+            2) run_menu_action uninstall_weekly_timer ;;
+            0|[Qq]|return|"") break ;;
+            *) log_warn "Invalid selection."; sleep 1 ;;
+        esac
+    done
+}
+
+interactive_tuning_menu() {
+    while true; do
+        clear 2>/dev/null || true
+        local cur_nm cur_bbr cur_swap cur_zram cur_dhcp cur_kern cur_avahi cur_cups cur_modem
+        cur_nm=$(status_get_wait_online)
+        cur_bbr=$(status_get_bbr)
+        cur_swap=$(status_get_swappiness)
+        cur_zram=$(status_get_zram)
+        cur_dhcp=$(status_get_dhcp)
+        cur_kern=$(status_get_kernel_privacy)
+        cur_avahi=$(status_get_avahi)
+        cur_cups=$(status_get_cups)
+        cur_modem=$(status_get_modem)
+
+        local nm_pill bbr_pill swap_pill zram_pill dhcp_pill kern_pill avahi_pill cups_pill modem_pill
+        [[ "$cur_nm" =~ DISABLED ]] && nm_pill="${GREEN}[✓ FAST BOOT (DISABLED)]${NC}" || nm_pill="${YELLOW}[● ENABLED (~7s delay)]${NC}"
+        [[ "$cur_bbr" =~ BBR ]] && bbr_pill="${GREEN}[✓ ACTIVE (BBR)]${NC}" || bbr_pill="${YELLOW}[○ $cur_bbr]${NC}"
+        [[ "$cur_swap" =~ 100 ]] && swap_pill="${GREEN}[✓ OPTIMIZED (100/50)]${NC}" || swap_pill="${YELLOW}[○ DEFAULT]${NC}"
+        [[ "$cur_zram" =~ ACTIVE ]] && zram_pill="${GREEN}[✓ ACTIVE]${NC}" || zram_pill="${YELLOW}[○ INACTIVE]${NC}"
+        [[ "$cur_dhcp" =~ BLOCKED ]] && dhcp_pill="${GREEN}[✓ BLOCKED (Shielded)]${NC}" || dhcp_pill="${YELLOW}[○ EXPOSED (Leaking)]${NC}"
+        [[ "$cur_kern" =~ HARDENED ]] && kern_pill="${GREEN}[✓ HARDENED]${NC}" || kern_pill="${YELLOW}[○ PERMISSIVE]${NC}"
+        [[ "$cur_avahi" =~ DISABLED ]] && avahi_pill="${GREEN}[✓ DISABLED]${NC}" || avahi_pill="${YELLOW}[● ACTIVE (mDNS)]${NC}"
+        [[ "$cur_cups" =~ DISABLED ]] && cups_pill="${GREEN}[✓ DISABLED]${NC}" || cups_pill="${YELLOW}[● ACTIVE (UDP 631)]${NC}"
+        [[ "$cur_modem" =~ DISABLED ]] && modem_pill="${GREEN}[✓ DISABLED]${NC}" || modem_pill="${YELLOW}[● ACTIVE (Modem)]${NC}"
+
+        echo -e "${CYAN}╭──────────────────────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}${GREEN}⚡ PERFORMANCE, PRIVACY & STARTUP OPTIMIZATION TOGGLES${NC}                  ${CYAN}│${NC}"
+        echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────────────────╯${NC}"
+        echo -e "${CYAN}┌── LIVE TOGGLES & SUBSYSTEM CONTROLS ─────────────────────────────────────────┐${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[1]${NC} NM Wait-Online Delay   : $nm_pill ⇄ Toggle Fast Boot"
+        echo -e "${CYAN}│${NC}  ${BOLD}[2]${NC} TCP Congestion (BBR)   : $bbr_pill ⇄ Toggle BBR / Cubic"
+        echo -e "${CYAN}│${NC}  ${BOLD}[3]${NC} Swappiness & VFS Cache : $swap_pill ⇄ Toggle 100/50 vs 60/100"
+        echo -e "${CYAN}│${NC}  ${BOLD}[4]${NC} ZRAM Compressed Swap   : $zram_pill ⇄ Toggle 50% RAM zstd swap"
+        echo -e "${CYAN}│${NC}  ${BOLD}[5]${NC} DHCP Hostname Privacy  : $dhcp_pill ⇄ Toggle Hostname Leak Shield"
+        echo -e "${CYAN}│${NC}  ${BOLD}[6]${NC} Kernel Memory Privacy  : $kern_pill ⇄ Toggle dmesg/kptr restrict"
+        echo -e "${CYAN}│${NC}  ${BOLD}[7]${NC} Avahi mDNS Daemon      : $avahi_pill ⇄ Toggle mDNS Broadcast"
+        echo -e "${CYAN}│${NC}  ${BOLD}[8]${NC} CUPS Network Polling   : $cups_pill ⇄ Toggle UDP 631 Printer Poll"
+        echo -e "${CYAN}│${NC}  ${BOLD}[9]${NC} ModemManager Daemon    : $modem_pill ⇄ Toggle Cellular Scanner"
+        echo -e "${CYAN}│${NC}  ${BOLD}[B]${NC} Toggle All 3 Discovery Broadcast Daemons at once"
+        echo -e "${CYAN}├──────────────────────────────────────────────────────────────────────────────┤${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[A]${NC} Apply All Performance & Privacy Tunings (One-click full setup)"
+        echo -e "${CYAN}│${NC}  ${BOLD}[R]${NC} Revert All Tunings to Linux Mint Distro Baseline Defaults"
+        echo -e "${CYAN}│${NC}  ${BOLD}[S]${NC} Display Detailed Diagnostics Status Report"
+        echo -e "${CYAN}│${NC}  ${BOLD}[0/Q]${NC} Return to Master Dashboard"
+        echo -e "${CYAN}└──────────────────────────────────────────────────────────────────────────────┘${NC}"
+        read -rp "Select an option [1-9, B, A, R, S, Q]: " topt
+
+        case "$topt" in
+            1) run_menu_action toggle_nm_wait_online ;;
+            2) run_menu_action toggle_bbr ;;
+            3) run_menu_action toggle_swappiness ;;
+            4) run_menu_action toggle_zram ;;
+            5) run_menu_action toggle_dhcp_privacy ;;
+            6) run_menu_action toggle_kernel_hardening ;;
+            7) run_menu_action toggle_avahi ;;
+            8) run_menu_action toggle_cups_browsed ;;
+            9) run_menu_action toggle_modemmanager ;;
+            [Bb]|daemons) run_menu_action toggle_broadcast_daemons ;;
+            [Aa]|apply) run_menu_action apply_system_tuning ;;
+            [Rr]|revert) run_menu_action revert_system_tuning ;;
+            [Ss]|status)
+                echo ""
+                show_tuning_status
+                echo ""
+                read -rp "Press Enter to continue..." _
+                ;;
+            0|[Qq]|exit|return|"") break ;;
+            *)
+                log_warn "Invalid selection: '$topt'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 show_tui_dashboard() {
+    if [ ! -t 0 ]; then
+        show_help
+        return 0
+    fi
+
     # Check for pending updates and cleanable caches
     local updates cleanable_kb
     updates=$(check_pending_updates)
@@ -2243,10 +3077,8 @@ show_tui_dashboard() {
             echo -e "  ${YELLOW}${BOLD}🔔 Notice: Pending maintenance actions detected.${NC}"
             read -rp "  Run package updates and cache cleanups now? [y/N/Skip]: " maint_ans
             if [[ "$maint_ans" =~ ^[Yy]$ ]]; then
-                set +e
-                update_and_clean
-                run_optimizer
-                set -e
+                run_menu_action update_and_clean
+                run_menu_action run_optimizer
                 echo ""
                 read -rp "Press Enter to proceed to Master Dashboard..." _ || true
                 updates=$(check_pending_updates)
@@ -2262,7 +3094,7 @@ show_tui_dashboard() {
         clear 2>/dev/null || true
 
         # Gather real-time status metrics
-        local cur_preset cur_bat cur_zram cur_bbr cur_dns cur_mac cur_timer cur_ipv6
+        local cur_preset cur_bat cur_zram cur_bbr cur_dns cur_mac cur_timer cur_ipv6 cur_nm
         cur_preset=$(status_get_preset)
         cur_bat=$(status_get_battery)
         cur_zram=$(status_get_zram)
@@ -2271,57 +3103,59 @@ show_tui_dashboard() {
         cur_mac=$(status_get_mac)
         cur_timer=$(status_get_timer)
         cur_ipv6=$(status_get_ipv6)
+        cur_nm=$(status_get_wait_online)
 
-echo -e "${CYAN}================================================================================${NC}"
-        echo -e "  ${BOLD}${GREEN}⚡ Laptop Linux Optimizer & System Control Center (v${VERSION})${NC}"
-        echo -e "${CYAN}================================================================================${NC}"
-        echo -e "  ${BOLD}LIVE SYSTEM & HARDWARE STATUS${NC}"
-        echo -e "  Active Preset   : ${GREEN}${BOLD}${cur_preset}${NC}"
-        echo -e "  Battery Limit   : ${CYAN}${cur_bat}${NC}"
-        echo -e "  ZRAM Swap       : ${GREEN}${cur_zram}${NC}"
-        echo -e "  TCP CC (BBR)    : ${GREEN}${cur_bbr}${NC}"
-        echo -e "  Encrypted DNS   : ${BLUE}${cur_dns}${NC}"
-        echo -e "  MAC Address     : ${MAGENTA}${cur_mac}${NC}"
-        echo -e "  Weekly Timer    : ${cur_timer}  |  IPv6: ${cur_ipv6}"
-        echo -e "${CYAN}--------------------------------------------------------------------------------${NC}"
+        local cur_nm_pill
+        [[ "$cur_nm" =~ DISABLED ]] && cur_nm_pill="${GREEN}${BOLD}[ FAST BOOT (Disabled) ]${NC} (No ~7s delay)" || cur_nm_pill="${YELLOW}${BOLD}[ ENABLED (~7s delay) ]${NC}"
+
+        echo -e "${CYAN}╭──────────────────────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}${GREEN}⚡ LAPTOP LINUX OPTIMIZER & SYSTEM CONTROL CENTER${NC}                  ${DIM}v${VERSION}${NC}  ${CYAN}│${NC}"
+        echo -e "${CYAN}╰──────────────────────────────────────────────────────────────────────────────╯${NC}"
+        echo -e "${CYAN}┌── LIVE SYSTEM & HARDWARE STATUS ─────────────────────────────────────────────┐${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}Active Preset${NC}   : ${GREEN}${BOLD}${cur_preset}${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}Battery Limit${NC}   : ${CYAN}${cur_bat}${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}ZRAM RAM Swap${NC}   : ${GREEN}${cur_zram}${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}TCP Congestion${NC}  : ${GREEN}${cur_bbr}${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}Encrypted DNS${NC}   : ${BLUE}${cur_dns}${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}Network MAC${NC}     : ${MAGENTA}${cur_mac}${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}NM Fast Boot${NC}    : ${cur_nm_pill}"
+        echo -e "${CYAN}│${NC}  ${BOLD}IPv6 Protocol${NC}   : ${cur_ipv6}  ${CYAN}│${NC}  ${BOLD}Weekly Timer${NC}: ${cur_timer}"
+        echo -e "${CYAN}└──────────────────────────────────────────────────────────────────────────────┘${NC}"
 
         # Display advisory banner if updates or cleanups pending
         if [ "$updates" -gt 0 ] || [ "$cleanable_kb" -gt 50000 ]; then
-            echo -e "  ${YELLOW}${BOLD}🔔 NOTIFICATIONS & ADVISORY:${NC}"
+            echo -e "${YELLOW}┌── NOTIFICATIONS & MAINTENANCE ADVISORY ──────────────────────────────────────┐${NC}"
             if [ "$updates" -gt 0 ]; then
-                echo -e "  ${YELLOW}●${NC} ${BOLD}$updates${NC} package update(s) available.   [Press ${BOLD}U${NC} to Update Now]"
+                echo -e "${YELLOW}│${NC}  ${YELLOW}●${NC} ${BOLD}$updates${NC} package update(s) available.          ${DIM}[Press ${BOLD}U${NC}${DIM} to Update Now]${NC}"
             fi
             if [ "$cleanable_kb" -gt 50000 ]; then
-                echo -e "  ${YELLOW}●${NC} ~${BOLD}$(format_kb "$cleanable_kb")${NC} cleanable caches.         [Press ${BOLD}C${NC} to Clean Now]"
+                echo -e "${YELLOW}│${NC}  ${YELLOW}●${NC} ~${BOLD}$(format_kb "$cleanable_kb")${NC} cleanable caches & logs.        ${DIM}[Press ${BOLD}C${NC}${DIM} to Clean Now]${NC}"
             fi
-            echo -e "${CYAN}--------------------------------------------------------------------------------${NC}"
+            echo -e "${YELLOW}└──────────────────────────────────────────────────────────────────────────────┘${NC}"
         fi
 
-        echo -e "  ${BOLD}[ PROFILE PRESETS ]${NC}"
-        echo -e "   ${BOLD}P)${NC} ${BOLD}Switch Profile Preset${NC}  (Desk: 60% | Balanced: 80% | Travel: 100%)"
-        echo -e ""
-        echo -e "  ${BOLD}[ MAINTENANCE & UPDATES ]${NC}"
-        echo -e "   ${BOLD}1)${NC} 🚀 Guided Laptop Optimization Wizard   ${DIM}(Full 5-step interactive setup)${NC}"
-        echo -e "   ${BOLD}2)${NC} Update Packages & Sweep Clean         ${DIM}(APT dist-upgrade + Flatpak)${NC}"
-        echo -e "   ${BOLD}3)${NC} System Housekeeping & Optimization    ${DIM}(Journals, APT, Temp caches)${NC}"
-        echo -e "   ${BOLD}4)${NC} Complete Master Suite                 ${DIM}(Update + Clean + Privacy + MAC)${NC}"
-        echo -e ""
-        echo -e "  ${BOLD}[ HARDWARE & NETWORK CONTROL ]${NC}"
-        echo -e "   ${BOLD}5)${NC} Battery Diagnostics & Charge Limiter Configuration"
-        echo -e "   ${BOLD}6)${NC} Encrypted DNS Manager (DoH / Relays / Tor)"
         local ipv6_lbl="ENABLED"
         [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" -eq 1 ] && ipv6_lbl="DISABLED"
-        echo -e "   ${BOLD}7)${NC} Network MAC Randomization & Inspection"
-        echo -e "   ${BOLD}8)${NC} Toggle IPv6 Protocol               ${DIM}(State: [${ipv6_lbl}])${NC}"
-        echo -e ""
-        echo -e "  ${BOLD}[ PERFORMANCE & PRIVACY ]${NC}"
-        echo -e "   ${BOLD}9)${NC} Performance & Kernel Tuning (BBR, ZRAM, Swappiness 100)"
-        echo -e "  ${BOLD}10)${NC} Privacy & Anti-Tracking Scrub (Browser caches, recent docs)"
-        echo -e "  ${BOLD}11)${NC} Automated Weekly Maintenance Timer (Systemd)"
-        echo -e ""
-        echo -e "  ${BOLD}D)${NC} Dialog/Whiptail Mode   ${BOLD}R)${NC} Refresh Status         ${BOLD}0/Q)${NC} Exit"
-        echo -e "${CYAN}================================================================================${NC}"
-        read -rp "Select an option [0-11, P, U, C, D, R, Q]: " opt
+
+        echo -e "${CYAN}┌── MANAGEMENT ACTIONS & SUBSYSTEM PANELS ─────────────────────────────────────┐${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[P]${NC} ${BOLD}Switch Profile Preset${NC}  ${DIM}(Desk: 60% | Balanced: 80% | Travel: 100%)${NC}"
+        echo -e "${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[1]${NC} 🚀 Guided Laptop Optimization Wizard   ${DIM}(Full 5-step interactive setup)${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[2]${NC} 📦 Update Packages & Sweep Clean       ${DIM}(APT dist-upgrade + Flatpak)${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[3]${NC} 🧹 System Housekeeping & Cleanups      ${DIM}(Journals, APT, Temp caches)${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[4]${NC} 🏆 Complete Master Suite               ${DIM}(Update + Clean + Privacy + MAC)${NC}"
+        echo -e "${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[5]${NC} 🔋 Battery Diagnostics & Charge Limiter Configuration"
+        echo -e "${CYAN}│${NC}  ${BOLD}[6]${NC} 🛡️  Encrypted DNS Manager              ${DIM}(DoH / Relays / Tor)${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[7]${NC} 🕵️  Network MAC Randomization & Inspection"
+        echo -e "${CYAN}│${NC}  ${BOLD}[8]${NC} 🌐 Toggle IPv6 Protocol                ${DIM}(State: [${ipv6_lbl}])${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[9]${NC} ⚡ Performance, Privacy & Startup Toggles ${DIM}(NM Boot, BBR, ZRAM, DHCP)${NC}"
+        echo -e "${CYAN}│${NC} ${BOLD}[10]${NC} 🔒 Privacy & Anti-Tracking Activity Scrub"
+        echo -e "${CYAN}│${NC} ${BOLD}[11]${NC} ⏱️  Automated Weekly Maintenance Timer  ${DIM}(Systemd)${NC}"
+        echo -e "${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}[D]${NC} Curses/Whiptail Mode   ${BOLD}[R]${NC} Refresh Status          ${BOLD}[0/Q]${NC} Exit"
+        echo -e "${CYAN}└──────────────────────────────────────────────────────────────────────────────┘${NC}"
+        read -rp "Select an option [0-11, P, U, C, D, R, Q]: " opt || break
 
         case "$opt" in
             [Pp]|preset)
@@ -2364,47 +3198,13 @@ echo -e "${CYAN}================================================================
                 fi
                 ;;
             5|battery)
-                echo ""
-                show_battery_status
-                echo ""
-                echo "1) Set charge threshold (e.g. 60, 80, 100)"
-                echo "2) Install persistent limiter service"
-                echo "3) Uninstall limiter service (restore 100%)"
-                echo "4) Return"
-                read -rp "Option [1-4]: " bopt
-                case "$bopt" in
-                    1)
-                        read -rp "Enter target percentage [20-100, default 80]: " bval
-                        bval="${bval:-80}"
-                        run_menu_action set_battery_threshold "$bval"
-                        ;;
-                    2)
-                        read -rp "Enter target persistent limit [20-100, default 80]: " bval
-                        bval="${bval:-80}"
-                        run_menu_action install_battery_service "$bval"
-                        ;;
-                    3)
-                        run_menu_action uninstall_battery_service
-                        ;;
-                esac
+                interactive_battery_menu
                 ;;
             6|dns)
                 run_menu_action interactive_dns_menu
                 ;;
             7|mac)
-                echo ""
-                show_mac_status
-                echo ""
-                echo "1) Randomize MAC addresses now (instant spoof)"
-                echo "2) Enable persistent NetworkManager auto-randomization"
-                echo "3) Disable persistent auto-randomization"
-                echo "4) Return"
-                read -rp "Option [1-4]: " mopt
-                case "$mopt" in
-                    1) run_menu_action randomize_mac ;;
-                    2) run_menu_action enable_mac_randomization ;;
-                    3) run_menu_action disable_mac_randomization ;;
-                esac
+                interactive_mac_menu
                 ;;
             8|ipv6)
                 echo ""
@@ -2414,26 +3214,18 @@ echo -e "${CYAN}================================================================
                 [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" -eq 1 ] && cur_st="DISABLED"
                 local next_action="Disable IPv6 (Block leaks & IPv6 traffic)"
                 [ "$cur_st" = "DISABLED" ] && next_action="Enable IPv6 system-wide"
-                echo "1) Toggle IPv6 ($next_action)"
-                echo "2) Return to Dashboard"
-                read -rp "Option [1-2, default 1]: " iopt
+                echo -e "${CYAN}┌── IPV6 PROTOCOL TOGGLE ──────────────────────────────────────────────────────┐${NC}"
+                echo -e "${CYAN}│${NC}  ${BOLD}[1]${NC} Toggle IPv6 Protocol ($next_action)"
+                echo -e "${CYAN}│${NC}  ${BOLD}[0/Q]${NC} Return to Master Dashboard"
+                echo -e "${CYAN}└──────────────────────────────────────────────────────────────────────────────┘${NC}"
+                read -rp "Option [1 or Q, default 1]: " iopt
                 iopt="${iopt:-1}"
                 case "$iopt" in
                     1) run_menu_action toggle_ipv6 ;;
                 esac
                 ;;
-            9|tune)
-                echo ""
-                show_tuning_status
-                echo ""
-                echo "1) Apply Performance & Privacy Tunings (BBR, ZRAM, Swappiness 100, DHCP privacy)"
-                echo "2) Revert Tunings to Standard Mint Defaults"
-                echo "3) Return"
-                read -rp "Option [1-3]: " topt
-                case "$topt" in
-                    1) run_menu_action apply_system_tuning ;;
-                    2) run_menu_action revert_system_tuning ;;
-                esac
+            9|tune|toggles)
+                interactive_tuning_menu
                 ;;
             10|privacy)
                 read -rp "Run privacy and activity scrub now? [y/N]: " conf_priv
@@ -2442,17 +3234,7 @@ echo -e "${CYAN}================================================================
                 fi
                 ;;
             11|timer)
-                echo ""
-                show_timer_status
-                echo ""
-                echo "1) Install / Enable Weekly Automated Timer"
-                echo "2) Uninstall / Disable Weekly Timer"
-                echo "3) Return"
-                read -rp "Option [1-3]: " tmopt
-                case "$tmopt" in
-                    1) run_menu_action install_weekly_timer ;;
-                    2) run_menu_action uninstall_weekly_timer ;;
-                esac
+                interactive_timer_menu
                 ;;
             0|[Qq]|exit|quit)
                 echo "Goodbye!"
@@ -2503,6 +3285,28 @@ show_help() {
     echo "    disable, off            Disable IPv6 system-wide (preserving loopback ::1)"
     echo "    enable, on              Enable IPv6 system-wide"
     echo ""
+    echo "  wait-online               NetworkManager wait-online boot delay toggle (Fast Boot)"
+    echo "    status                  Display wait-online service enabled/disabled state"
+    echo "    toggle                  Toggle between Fast Boot (disabled) and Network Wait"
+    echo "    disable, off            Disable wait-online (~7s delay removed for fast boot)"
+    echo "    enable, on              Enable wait-online (boot waits for network)"
+    echo ""
+    echo "  tune, harden              Performance tuning & privacy hardening"
+    echo "    status                  Display TCP BBR, ZRAM, swappiness, and privacy status"
+    echo "    menu                    Interactive performance, privacy & startup toggle hub"
+    echo "    apply                   Enable BBR, ZRAM, swappiness 100, DHCP privacy & fast boot"
+    echo "    revert                  Revert system tunings to standard Linux Mint defaults"
+    echo "    wait-online [toggle]    Toggle NetworkManager wait-online boot delay (~7s saved)"
+    echo "    bbr [toggle]            Toggle Google TCP BBR low-latency congestion control"
+    echo "    swappiness [toggle]     Toggle swappiness & cache pressure (100/50 vs 60/100)"
+    echo "    zram [toggle]           Toggle ZRAM 50% RAM compressed swap"
+    echo "    dhcp [toggle]           Toggle DHCP hostname leak protection"
+    echo "    kernel [toggle]         Toggle kernel memory privacy (dmesg & kptr restrict)"
+    echo "    avahi [toggle]          Toggle Avahi mDNS discovery broadcast daemon"
+    echo "    cups [toggle]           Toggle CUPS network printer polling daemon"
+    echo "    modem [toggle]          Toggle ModemManager cellular serial scanner"
+    echo "    daemons [toggle]        Toggle all 3 discovery broadcast daemons at once"
+    echo ""
     echo "  preset, profile           Switch or view laptop performance/battery profile presets"
     echo "    status                  Display active profile preset & hardware status"
     echo "    apply <desk|balanced|travel>  Apply one-click profile preset"
@@ -2512,17 +3316,13 @@ show_help() {
     echo ""
     echo "  check, advisory           Check pending package updates and cleanable cache storage"
     echo "  summary, status           Display comprehensive summary of all system statuses"
-    echo "  tui, dashboard, menu      Launch interactive terminal dashboard (TUI)"
-    echo "    --dialog, --whiptail    Launch in modal dialog / whiptail GUI mode"
+    echo "  tui, dashboard, menu      Launch interactive terminal dashboard (TUI / Curses)"
+    echo "    --dialog, --whiptail    Launch in modal dialog / whiptail curses GUI mode"
     echo ""
     echo "  optimize, clean           Run routine housekeeping (APT, Flatpak, journals, temp)"
     echo "  update, upgrade           Update all packages (APT & Flatpak) and purge orphans/caches"
     echo "  all                       Full update followed by complete system housekeeping"
     echo "  privacy                   Scrub privacy caches (browsers, recent files, DNS, trash)"
-    echo "  tune, harden              Performance tuning & privacy hardening"
-    echo "    status                  Display TCP BBR, ZRAM, swappiness, and privacy status"
-    echo "    apply                   Enable BBR, ZRAM, swappiness 100, DHCP privacy & fast boot"
-    echo "    revert                  Revert system tunings to standard Linux Mint defaults"
     echo "  full-suite                Total master run: update + housekeeping + privacy + MAC"
     echo ""
     echo "  timer                     Automated weekly background maintenance"
@@ -2544,6 +3344,9 @@ show_help() {
     echo "  $0 battery status                 # Check battery health & current threshold"
     echo "  sudo $0 battery set 80            # Set charge limiter to 80%"
     echo "  sudo $0 battery install 80        # Persist 80% limit across reboots & sleep"
+    echo "  sudo $0 wait-online toggle        # Toggle NetworkManager boot delay on/off"
+    echo "  sudo $0 tune bbr toggle           # Toggle Google BBR TCP congestion control"
+    echo "  sudo $0 tune zram toggle          # Toggle ZRAM compressed RAM swap"
     echo "  sudo $0 dns apply cloudflare      # Switch to Cloudflare DoH"
     echo "  sudo $0 dns apply 0               # Switch to Auto-Failover pool"
     echo "  sudo $0 dns revert                # Revert back to standard DHCP DNS"
@@ -2709,6 +3512,34 @@ case "$CMD" in
         enable_ipv6
         ;;
 
+    wait-online|nm-wait-online)
+        SUB="${1:-toggle}"
+        shift || true
+        case "$SUB" in
+            status)
+                echo "NM Wait-Online Delay: $(status_get_wait_online)"
+                ;;
+            toggle)
+                toggle_nm_wait_online
+                ;;
+            disable|off)
+                disable_nm_wait_online
+                ;;
+            enable|on)
+                enable_nm_wait_online
+                ;;
+            *)
+                log_err "Unknown wait-online command: '$SUB'"
+                echo "Usage: $0 wait-online [status | toggle | disable | enable]"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    toggle-wait-online)
+        toggle_nm_wait_online
+        ;;
+
     optimize|clean|--run|-r)
         run_optimizer
         ;;
@@ -2732,15 +3563,136 @@ case "$CMD" in
             status)
                 show_tuning_status
                 ;;
+            menu|interactive|tui)
+                interactive_tuning_menu
+                ;;
             apply|enable|on)
                 apply_system_tuning
                 ;;
             revert|disable|off)
                 revert_system_tuning
                 ;;
+            wait-online|nm-wait-online|nm|fast-boot)
+                ACT="${1:-toggle}"
+                case "$ACT" in
+                    toggle) toggle_nm_wait_online ;;
+                    enable|on) enable_nm_wait_online ;;
+                    disable|off) disable_nm_wait_online ;;
+                    status) echo "NM Wait-Online Delay: $(status_get_wait_online)" ;;
+                    *) log_err "Unknown wait-online action: '$ACT'"; exit 1 ;;
+                esac
+                ;;
+            bbr|tcp)
+                ACT="${1:-toggle}"
+                case "$ACT" in
+                    toggle) toggle_bbr ;;
+                    enable|on) enable_bbr ;;
+                    disable|off) disable_bbr ;;
+                    status) echo "TCP Congestion Control: $(status_get_bbr)" ;;
+                    *) log_err "Unknown bbr action: '$ACT'"; exit 1 ;;
+                esac
+                ;;
+            swappiness|swap|vfs)
+                ACT="${1:-toggle}"
+                case "$ACT" in
+                    toggle) toggle_swappiness ;;
+                    enable|on) enable_swappiness ;;
+                    disable|off) disable_swappiness ;;
+                    status) echo "Swappiness / VFS: $(status_get_swappiness)" ;;
+                    *) log_err "Unknown swappiness action: '$ACT'"; exit 1 ;;
+                esac
+                ;;
+            zram)
+                ACT="${1:-toggle}"
+                case "$ACT" in
+                    toggle) toggle_zram ;;
+                    enable|on) enable_zram ;;
+                    disable|off) disable_zram ;;
+                    status) echo "ZRAM Swap: $(status_get_zram)" ;;
+                    *) log_err "Unknown zram action: '$ACT'"; exit 1 ;;
+                esac
+                ;;
+            dhcp|dhcp-privacy|hostname)
+                ACT="${1:-toggle}"
+                case "$ACT" in
+                    toggle) toggle_dhcp_privacy ;;
+                    enable|on) enable_dhcp_privacy ;;
+                    disable|off) disable_dhcp_privacy ;;
+                    status) echo "DHCP Hostname Leak: $(status_get_dhcp)" ;;
+                    *) log_err "Unknown dhcp action: '$ACT'"; exit 1 ;;
+                esac
+                ;;
+            kernel|privacy-sysctl|hardening)
+                ACT="${1:-toggle}"
+                case "$ACT" in
+                    toggle) toggle_kernel_hardening ;;
+                    enable|on) enable_kernel_hardening ;;
+                    disable|off) disable_kernel_hardening ;;
+                    status) echo "Kernel Privacy: $(status_get_kernel_privacy)" ;;
+                    *) log_err "Unknown kernel action: '$ACT'"; exit 1 ;;
+                esac
+                ;;
+            avahi|mdns)
+                ACT="${1:-toggle}"
+                case "$ACT" in
+                    toggle) toggle_avahi ;;
+                    enable|on)
+                        systemctl is-active --quiet avahi-daemon || toggle_avahi
+                        ;;
+                    disable|off)
+                        systemctl is-active --quiet avahi-daemon && toggle_avahi
+                        ;;
+                    status) echo "Avahi mDNS: $(status_get_avahi)" ;;
+                    *) log_err "Unknown avahi action: '$ACT'"; exit 1 ;;
+                esac
+                ;;
+            cups|cups-browsed)
+                ACT="${1:-toggle}"
+                case "$ACT" in
+                    toggle) toggle_cups_browsed ;;
+                    enable|on)
+                        systemctl is-active --quiet cups-browsed || toggle_cups_browsed
+                        ;;
+                    disable|off)
+                        systemctl is-active --quiet cups-browsed && toggle_cups_browsed
+                        ;;
+                    status) echo "CUPS Browsed: $(status_get_cups)" ;;
+                    *) log_err "Unknown cups action: '$ACT'"; exit 1 ;;
+                esac
+                ;;
+            modem|modemmanager)
+                ACT="${1:-toggle}"
+                case "$ACT" in
+                    toggle) toggle_modemmanager ;;
+                    enable|on)
+                        systemctl is-active --quiet ModemManager || toggle_modemmanager
+                        ;;
+                    disable|off)
+                        systemctl is-active --quiet ModemManager && toggle_modemmanager
+                        ;;
+                    status) echo "ModemManager: $(status_get_modem)" ;;
+                    *) log_err "Unknown modem action: '$ACT'"; exit 1 ;;
+                esac
+                ;;
+            daemons|broadcast)
+                ACT="${1:-toggle}"
+                case "$ACT" in
+                    toggle) toggle_broadcast_daemons ;;
+                    enable|on)
+                        systemctl is-active --quiet avahi-daemon || toggle_broadcast_daemons
+                        ;;
+                    disable|off)
+                        systemctl is-active --quiet avahi-daemon && toggle_broadcast_daemons
+                        ;;
+                    status)
+                        echo "Avahi: $(status_get_avahi) | CUPS: $(status_get_cups) | Modem: $(status_get_modem)"
+                        ;;
+                    *) log_err "Unknown daemons action: '$ACT'"; exit 1 ;;
+                esac
+                ;;
             *)
                 log_err "Unknown tune command: '$SUB'"
-                echo "Usage: $0 tune [status | apply | revert]"
+                echo "Usage: $0 tune [status | menu | apply | revert | wait-online | bbr | swappiness | zram | dhcp | kernel | avahi | cups | modem | daemons]"
                 exit 1
                 ;;
         esac

@@ -226,6 +226,103 @@ assert_true "disable_ipv6 function is defined" 'grep -q "^disable_ipv6()" ./mint
 assert_true "enable_ipv6 function is defined" 'grep -q "^enable_ipv6()" ./mint-admin.sh'
 assert_true "CLI help documents ipv6 toggle" './mint-admin.sh help | grep "toggle" >/dev/null'
 
+# ------------------------------------------------------------------------------
+# Test 15: Subsystem Toggles, NM Wait-Online Control & Curses/Ink TUI
+# ------------------------------------------------------------------------------
+echo "--- Test 15: Subsystem Toggles, NM Wait-Online & Curses/Ink TUI ---"
+assert_true "toggle_nm_wait_online function is defined" 'grep -q "^toggle_nm_wait_online()" ./mint-admin.sh'
+assert_true "enable_nm_wait_online function is defined" 'grep -q "^enable_nm_wait_online()" ./mint-admin.sh'
+assert_true "disable_nm_wait_online function is defined" 'grep -q "^disable_nm_wait_online()" ./mint-admin.sh'
+assert_true "status_get_wait_online function is defined" 'grep -q "^status_get_wait_online()" ./mint-admin.sh'
+assert_true "toggle_bbr function is defined" 'grep -q "^toggle_bbr()" ./mint-admin.sh'
+assert_true "toggle_swappiness function is defined" 'grep -q "^toggle_swappiness()" ./mint-admin.sh'
+assert_true "toggle_zram function is defined" 'grep -q "^toggle_zram()" ./mint-admin.sh'
+assert_true "toggle_dhcp_privacy function is defined" 'grep -q "^toggle_dhcp_privacy()" ./mint-admin.sh'
+assert_true "toggle_kernel_hardening function is defined" 'grep -q "^toggle_kernel_hardening()" ./mint-admin.sh'
+assert_true "toggle_avahi function is defined" 'grep -q "^toggle_avahi()" ./mint-admin.sh'
+assert_true "toggle_cups_browsed function is defined" 'grep -q "^toggle_cups_browsed()" ./mint-admin.sh'
+assert_true "toggle_modemmanager function is defined" 'grep -q "^toggle_modemmanager()" ./mint-admin.sh'
+assert_true "toggle_broadcast_daemons function is defined" 'grep -q "^toggle_broadcast_daemons()" ./mint-admin.sh'
+assert_true "interactive_tuning_menu function is defined" 'grep -q "^interactive_tuning_menu()" ./mint-admin.sh'
+assert_true "whiptail_tuning_menu function is defined" 'grep -q "^whiptail_tuning_menu()" ./mint-admin.sh'
+assert_true "CLI help documents wait-online command" './mint-admin.sh help | grep "wait-online" >/dev/null'
+assert_true "CLI wait-online status outputs valid state" './mint-admin.sh wait-online status | grep "NM Wait-Online Delay:" >/dev/null'
+assert_true "CLI tune wait-online status outputs valid state" './mint-admin.sh tune wait-online status | grep "NM Wait-Online Delay:" >/dev/null'
+assert_true "CLI summary reports NM Boot Speed Delay" './mint-admin.sh summary | grep "NM Boot Speed Delay" >/dev/null'
+
+# ------------------------------------------------------------------------------
+# Test 16: DHCP Hostname Privacy via nmcli Profiles
+# ------------------------------------------------------------------------------
+echo "--- Test 16: DHCP Hostname Privacy via nmcli Profiles ---"
+assert_true "enable_dhcp_privacy modifies connection profiles via nmcli" 'grep -A 15 "^enable_dhcp_privacy()" ./mint-admin.sh | grep -q "nmcli con modify"'
+assert_true "disable_dhcp_privacy restores connection profiles via nmcli" 'grep -A 15 "^disable_dhcp_privacy()" ./mint-admin.sh | grep -q "nmcli con modify"'
+assert_true "status_get_dhcp inspects active connection profile via nmcli" 'grep -A 20 "^status_get_dhcp()" ./mint-admin.sh | grep -q "nmcli -g ipv4.dhcp-send-hostname"'
+
+# ------------------------------------------------------------------------------
+# Test 17: Intermediate Symlink Traversal Immunity (is_safe_user_path)
+# ------------------------------------------------------------------------------
+echo "--- Test 17: Intermediate Symlink Traversal Immunity ---"
+assert_true "is_safe_user_path function is defined" 'grep -q "^is_safe_user_path()" ./mint-admin.sh'
+assert_true "clean_privacy checks is_safe_user_path on user home and recent files" 'grep -A 50 "^clean_privacy()" ./mint-admin.sh | grep -q "is_safe_user_path \"\$h\""'
+assert_true "clean_privacy checks is_safe_user_path on browser caches" 'grep -A 100 "^clean_privacy()" ./mint-admin.sh | grep -q "is_safe_user_path \"\$h\" \"\$cdir\""'
+assert_true "clean_privacy checks is_safe_user_path on trash dirs" 'grep -A 140 "^clean_privacy()" ./mint-admin.sh | grep -q "is_safe_user_path \"\$h\" \"\$tdir\""'
+assert_true "clean_user_cache checks is_safe_user_path on thumbnail dirs" 'grep -A 20 "^clean_user_cache()" ./mint-admin.sh | grep -q "is_safe_user_path \"\$h\" \"\$h/\.cache/thumbnails\""'
+
+# Live functional test for is_safe_user_path
+TEST_SAFE_SCRIPT=$(mktemp)
+cat << 'EOF' > "$TEST_SAFE_SCRIPT"
+sed -n '/^is_safe_user_path()/,/^}/p' ./mint-admin.sh > "${TEST_SAFE_SCRIPT}.fn"
+source "${TEST_SAFE_SCRIPT}.fn"
+THOME=$(mktemp -d /home/minty/test_home_XXXXXX)
+TOUTSIDE=$(mktemp -d /tmp/outside_XXXXXX)
+ln -s "$TOUTSIDE" "$THOME/.local"
+mkdir -p "$TOUTSIDE/share/Trash/files"
+if is_safe_user_path "$THOME" "$THOME/.local/share/Trash/files"; then
+    res=1
+else
+    res=0
+fi
+rm -rf "$THOME" "$TOUTSIDE" "${TEST_SAFE_SCRIPT}.fn"
+exit $res
+EOF
+assert_true "is_safe_user_path blocks intermediate symlink attacks" 'bash "$TEST_SAFE_SCRIPT"'
+rm -f "$TEST_SAFE_SCRIPT"
+
+# ------------------------------------------------------------------------------
+# Test 18: DNS Anonymized Relays v3 & Fail-Stop Verification
+# ------------------------------------------------------------------------------
+echo "--- Test 18: DNS Anonymized Relays v3 & Error Handling ---"
+assert_true "get_active_relays function is defined" 'grep -q "^get_active_relays()" ./mint-admin.sh'
+assert_true "apply_dnscrypt_config uses resolvers-list/v3/relays.md" 'grep -q "resolvers-list/v3/relays.md" ./mint-admin.sh'
+assert_true "apply_dnscrypt_config takes pre-modification .bak snapshot" 'grep -A 10 "^apply_dnscrypt_config()" ./mint-admin.sh | grep -q "DNS_CONFIG.*\.bak"'
+assert_true "activate_dns_config helper enforces fail-stop" 'grep -q "^activate_dns_config()" ./mint-admin.sh'
+
+# ------------------------------------------------------------------------------
+# Test 19: Systemd Timer Security & Space Quoting
+# ------------------------------------------------------------------------------
+echo "--- Test 19: Systemd Timer Security & Space Quoting ---"
+assert_true "Documentation= is quoted for path with spaces" 'grep -q "Documentation=\"file://\$exec_target\"" ./mint-admin.sh'
+assert_true "install_weekly_timer fails if canonical installation fails" 'grep -A 15 "^install_weekly_timer()" ./mint-admin.sh | grep -q "Failed to securely install root-owned binary"'
+assert_true "uninstall_weekly_timer removes canonical binary" 'grep -A 12 "^uninstall_weekly_timer()" ./mint-admin.sh | grep -q "rm -f \"\$CANONICAL_BIN\""'
+
+# ------------------------------------------------------------------------------
+# Test 20: TUI Subshell Isolation & Non-TTY Handling
+# ------------------------------------------------------------------------------
+echo "--- Test 20: TUI Subshell Isolation & Non-TTY Handling ---"
+assert_true "run_menu_action uses isolated subshell" 'grep -A 8 "^run_menu_action()" ./mint-admin.sh | grep -q "( \"\$@\" ) || rc="'
+assert_true "run_whiptail_action uses isolated subshell" 'grep -A 8 "^run_whiptail_action()" ./mint-admin.sh | grep -q "( \"\$@\" ) || rc="'
+assert_true "show_tui_dashboard checks non-TTY stdin" 'grep -A 6 "^show_tui_dashboard()" ./mint-admin.sh | grep -q "\[ ! -t 0 \]"'
+assert_true "show_whiptail_tui includes ZRAM status in backtitle" 'grep -A 30 "^show_whiptail_tui()" ./mint-admin.sh | grep -q "ZRAM: \$z_info"'
+
+# ------------------------------------------------------------------------------
+# Test 21: Tuning Baseline Restoration & TCP FastOpen
+# ------------------------------------------------------------------------------
+echo "--- Test 21: Tuning Baseline Restoration & TCP FastOpen ---"
+assert_true "save_tuning_baseline records daemon active states" 'grep -A 30 "^save_tuning_baseline()" ./mint-admin.sh | grep -q "BASE_AVAHI_ACTIVE"'
+assert_true "disable_bbr restores net.ipv4.tcp_fastopen" 'grep -A 15 "^disable_bbr()" ./mint-admin.sh | grep -q "net\.ipv4\.tcp_fastopen"'
+assert_true "revert_system_tuning restores daemons based on baseline state" 'grep -A 35 "^revert_system_tuning()" ./mint-admin.sh | grep -q "b_avahi"'
+assert_true "show_tuning_status strictly checks swappiness 100" 'grep -A 20 "^show_tuning_status()" ./mint-admin.sh | grep -q "\[ \"\$swappiness\" -eq 100 \]"'
+
 echo "=========================================================="
 if [ "$FAILED" -eq 0 ]; then
     echo "ALL $TOTAL TESTS PASSED SUCCESSFULLY!"
