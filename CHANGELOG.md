@@ -72,21 +72,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Medium & Hygiene Fixes**:
   - Quoted `$0` in `check_root` guidance hints to handle paths containing spaces safely.
   - Hardened battery sysfs node traversal to handle spaces safely using newline splitting.
-    - **ZRAM 50% Compressed RAM Swap**: `toggle_zram`
-    - **DHCP Hostname Leak Shield**: `toggle_dhcp_privacy`
-    - **Kernel Memory Privacy Hardening (dmesg & kptr)**: `toggle_kernel_hardening`
-    - **Avahi mDNS Discovery Broadcast Daemon**: `toggle_avahi`
-    - **CUPS Network Printer Polling (UDP 631)**: `toggle_cups_browsed`
-    - **ModemManager Cellular Serial Scanner**: `toggle_modemmanager`
-    - **All 3 Broadcast Daemons**: `toggle_broadcast_daemons`
-  - All toggles are exposed in CLI: `mint-admin tune <subsystem> [toggle|enable|disable|status]`.
-- **Interactive Performance, Privacy & Startup Toggle Hub (`Option 9` / `mint-admin tune menu`)**:
-  - Full-screen interactive hub presenting live indicators for all subsystems and 1-key instant toggles.
-- **Modern Curses / Ink-Style Terminal UI**:
-  - Upgraded ANSI Terminal Dashboard with Ink-style framing, Unicode box drawing (`╭─╮│╰─╯`, `┌─┐│└─┘`), and high-contrast status pill badges.
-  - Upgraded Curses / Whiptail GUI modal mode (`mint-admin tui --dialog` or `[D]`) with full curses dialog submenus for Tuning, Battery, MAC, and Timers.
-- **Test Suite Expansion**:
-  - Added Test 15 to `tests/test_audit_fixes.sh`, expanding test suite to 68 automated unit tests.
 
 ## [v0.2.1] - 2026-11-01
 
