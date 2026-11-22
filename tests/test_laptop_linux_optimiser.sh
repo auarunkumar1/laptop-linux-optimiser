@@ -832,6 +832,7 @@ assert_true "TUI dashboard displays Root User Hardening Shield" 'grep -q "Root U
 assert_true "TUI dashboard handles [L] root lock dispatch" 'grep -A 25 "case \"\$opt\" in" ./laptop-linux-optimiser.sh | grep -q "\[Ll\]|root|lock-root)"'
 assert_true "Interactive tuning menu includes Root User Hardening" 'grep -q "\[L\].*Root User Hardening" ./laptop-linux-optimiser.sh'
 assert_true "Whiptail tuning menu includes Root Account Hardening" 'grep -q "Root Account Hardening" ./laptop-linux-optimiser.sh'
+assert_true "Whiptail main menu includes Root Account Hardening" 'grep -A 45 "show_whiptail_tui()" ./laptop-linux-optimiser.sh | grep -q "Root Account Hardening Shield"'
 assert_true "Guided wizard Step 13 includes Root Account Hardening" 'grep -A 30 "\[Step 13/14\]" ./laptop-linux-optimiser.sh | grep -q "Root Account Hardening"'
 
 # ------------------------------------------------------------------------------

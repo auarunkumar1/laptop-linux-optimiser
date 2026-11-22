@@ -217,6 +217,30 @@ sudo ./laptop-linux-optimiser.sh ssh disable
 sudo ./laptop-linux-optimiser.sh ssh toggle
 ```
 
+### Security Hardening: Root User Access & Delegation Shield
+Enforces the principle of least privilege by disabling direct root authentication, enforcing `sudo` audit accountability, and eliminating remote root attack surfaces.
+
+```bash
+# Check root password lock, shell validity, and SSH policies (works unprivileged)
+./laptop-linux-optimiser.sh root status
+
+# Lock root account, block direct SSH root logins, and quarantine authorized keys
+sudo ./laptop-linux-optimiser.sh root lock
+
+# Interactively toggle root account status with safety confirmation prompt
+sudo ./laptop-linux-optimiser.sh root toggle
+
+# Unlock root account (restores original password state and SSH key files)
+sudo ./laptop-linux-optimiser.sh root unlock
+```
+
+**Built-In Safety Controls:**
+- **Pre-Flight Admin Interlock**: Verifies that an administrative user exists in `sudo`, `wheel`, or `admin` before locking; aborts immediately if no sudo user is found to prevent accidental lockouts.
+- **Login Shell Preservation**: Enforces `/bin/bash` login shell for the root account; never sets shell to `/sbin/nologin` or `/bin/false`, preserving `sudo -i` and emergency single-user recovery mode.
+- **OpenSSH Drop-in Isolation**: Enforces `PermitRootLogin no` via `/etc/ssh/sshd_config.d/00-disable-root-login.conf`.
+- **Public Key Quarantine**: Backs up `/root/.ssh/authorized_keys` to `authorized_keys.disabled` (mode `0600`) rather than deleting them.
+- **Unprivileged State Manifest**: Deploys `/etc/laptop-root-lock.conf` (`mode 0644`) so non-root terminal dashboards and status scripts can query state without sudo elevation.
+
 ### Performance, Startup & Subsystem Toggles
 ```bash
 # Comprehensive performance and sysctl status
@@ -381,12 +405,13 @@ Laptop Linux Optimizer follows strict defensive engineering practices:
 6. **Storm-Free Udev Power Rules**: Battery threshold udev rules monitor `ATTR{type}=="Mains"` power transitions and read current limits before writing, eliminating recursive uevent storms.
 7. **Bootstrap DNS Deadlock Prevention**: The DNS Leak Shield explicitly whitelists `dnscrypt-proxy` system UIDs and upstream fallback resolvers (`9.9.9.9`, `1.1.1.1`) before applying port 53 DROP rules, preventing boot-time name resolution deadlock.
 8. **Loopback & Subsystem Isolation**: Userspace transport shaper rules explicitly exclude loopback traffic (`! -d 127.0.0.0/8`, `! -d ::1/128`) and bypass local resolver/Tor UIDs (`-j RETURN`), preventing proxy feedback loops.
+9. **Root Delegation & Anti-Lockout Defense**: Root account password locking enforces pre-flight administrative group membership verification (`sudo`/`wheel`), preserves the `/bin/bash` recovery shell, and quarantines authorized SSH keys to prevent backdoor escalation.
 
 ---
 
 ## Automated Verification & Test Suite
 
-The project features a comprehensive automated regression suite containing **178 validated assertions**:
+The project features a comprehensive automated regression suite containing **455 validated assertions across 54 test modules**:
 
 ```bash
 # Run the complete test suite

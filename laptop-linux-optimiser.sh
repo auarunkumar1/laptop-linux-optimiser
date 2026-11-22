@@ -7208,6 +7208,7 @@ show_whiptail_tui() {
             "13" "Popular Themes Gallery & Uniform Styling" \
             "14" "GRUB Bootloader Configuration & Recovery" \
             "15" "Media Codecs, Fonts & Hardware Acceleration Drivers" \
+            "L"  "Root Account Hardening Shield (Lock Root & SSH Block)" \
             "A"  "Switch to Curses / Ink Terminal Dashboard" \
             3>&1 1>&2 2>&3 || echo "Q")
 
@@ -7220,6 +7221,7 @@ show_whiptail_tui() {
             5) interactive_dns_menu ;;
             6) whiptail_mac_menu "$tui_cmd" ;;
             7) whiptail_tuning_menu "$tui_cmd" ;;
+            L) run_whiptail_action toggle_root_user ;;
             8) run_whiptail_action clean_privacy "privacy" ;;
             9) whiptail_timer_menu "$tui_cmd" ;;
             10)
@@ -7406,7 +7408,7 @@ interactive_tuning_menu() {
         echo -e "${CYAN}│${NC}  ${BOLD}[S]${NC} Detailed Report        : Display full status diagnostics report"
         echo -e "${CYAN}│${NC}  ${BOLD}[0/Q]${NC} Return to Master Dashboard"
         echo -e "${CYAN}└──────────────────────────────────────────────────────────────────────────────┘${NC}"
-        read -rp "Select an option to toggle [0-9, O, E, K, V, W, P, T, H, M, F, B, A, R, S, Q]: " topt
+        read -rp "Select an option to toggle [0-9, O, E, K, V, W, P, L, T, H, M, F, B, A, R, S, Q]: " topt
 
         case "$topt" in
             [Oo]|os|platform) run_menu_action toggle_target_os ;;
