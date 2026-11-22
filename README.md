@@ -3,12 +3,12 @@
 [![Release](https://img.shields.io/badge/version-v0.5.15-blue.svg)](https://github.com/auarunkumar1/laptop-linux-optimiser/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Pop!_OS%20%7C%20Linux%20Mint%20%7C%20Ubuntu%20%7C%20Debian-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-455%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-456%20passed-brightgreen.svg)]()
 [![Shell](https://img.shields.io/badge/shell-bash%20%3E%3D%204.4-brightgreen.svg)]()
 
 **Laptop Linux Optimizer** (`laptop-linux-optimiser.sh`) is a unified, privacy-first system administration, battery preservation, and network resilience suite for Linux laptops. Built for modern Linux environments, it provides native, fine-tuned optimizations for **Pop!_OS (COSMIC Desktop)**, **Linux Mint (Cinnamon)**, **Ubuntu (22.04/24.04+)**, and **Debian (12+)**.
 
-Designed for developers, privacy-conscious professionals, and mobile Linux users, Laptop Linux Optimizer replaces fragmented scripts and manual tweaks with a single, hardened tool. It safeguards battery cell chemistry, enforces transport-level privacy and protocol neutrality against carrier throttling, locks down network exposure on public Wi-Fi, and streamlines system maintenance through an interactive terminal dashboard.
+Designed for developers, privacy-conscious professionals, and mobile Linux users, Laptop Linux Optimizer replaces fragmented scripts and manual tweaks with a single, hardened tool. It safeguards battery cell chemistry, enforces encrypted DNS privacy with local zero-log caching, locks down network exposure on public Wi-Fi, eliminates touchpad stutter, and streamlines system maintenance through an interactive terminal dashboard.
 
 ---
 
@@ -21,7 +21,7 @@ Designed for developers, privacy-conscious professionals, and mobile Linux users
 | 🖱️ **Hardware Input Resilience** | **ELAN Touchpad, Responsiveness & Zero-Lag** | Eliminates idle dropout, mid-drag freezes, microsecond wake-up stutter, and sluggish tracking on AMD Ryzen & Intel laptops via DesignWare host controller PM (`on`), deep CPU idle C-state caps (`processor.max_cstate=2`), GPU Panel Self Refresh wake-up bypass (`amdgpu.dcdebugmask=0x410` / `i915.enable_psr=0`), and libinput 31x31 resolution & light pressure calibration (`/etc/libinput/local-overrides.quirks`). |
 | ⚡ **Memory & Kernel Tuning** | **ZRAM & TCP BBR** | Deploys compressed RAM swap (`zstd` algorithm) with distro-optimized swappiness (180 for Pop!_OS, 100 for Mint). Activates Google TCP BBR congestion control and trims unnecessary systemd boot delays. |
 | 🛡️ **Encrypted DNS & Leak Shield** | **DoH, Relays, Tor & Killswitch** | Hardens `dnscrypt-proxy` across 14 resolver profiles (Auto-Failover pool, Cloudflare, Quad9, AdGuard, genuine DNSCrypt Anonymized Relays, and Tor onion routing). Features in-memory zero-log caching (`cache_size=8192`) and an iptables **DNS Leak Shield** killswitch with bootstrap resolver deadlock protection. |
-| 📡 **Transport Integrity** | **Anti-Throttling & Middlebox Defense** | Mitigates discriminatory carrier throttling, intrusive middlebox metadata snooping, and stream degradation on hotel/cellular links. Features in-kernel TCP MSS packet boundary framing (Tier 1) and an optional dual-stack userspace transport shaper (Tier 2) with systemd lifecycle hooks and UID loopback isolation. |
+| 🔥 **Host Firewall Shield** | **Stateful Laptop UFW** | Deploys a hardened host-level firewall profile that blocks unsolicited inbound connections on public networks while preserving outbound traffic, established connections, and LAN discovery. |
 | 🔒 **Inbound Security** | **SSH Port Shield** | Masks and disables inbound SSH server units (`ssh.service`, `sshd.service`, `ssh.socket`) to eliminate unauthorized port 22 exposure and unsolicited socket triggers on untrusted networks. |
 | 🛡️ **Root Account Hardening** | **Safe Root Lock & Delegation** | Enforces root password lock (`passwd -l root`), verifies administrative sudo users before locking to prevent lockouts, preserves root login shell (`/bin/bash`), enforces SSH drop-in root blocks (`PermitRootLogin no`), and isolates direct root SSH keys. |
 | 🖨️ **LAN Discovery Protection** | **Avahi & CUPS Safeguards** | Preserves `cups-browsed` (UDP 631) and `avahi-daemon` (mDNS) so network printing and LocalSend peer-to-peer file sharing continue working without interruption. |
@@ -404,14 +404,14 @@ Laptop Linux Optimizer follows strict defensive engineering practices:
 5. **Atomic Baseline State Capture**: Baseline sysctl parameters and service states are recorded into `/var/lib/laptop-linux-optimiser/tuning-baseline.env` before modifications occur, ensuring `tune revert` accurately restores the original system state.
 6. **Storm-Free Udev Power Rules**: Battery threshold udev rules monitor `ATTR{type}=="Mains"` power transitions and read current limits before writing, eliminating recursive uevent storms.
 7. **Bootstrap DNS Deadlock Prevention**: The DNS Leak Shield explicitly whitelists `dnscrypt-proxy` system UIDs and upstream fallback resolvers (`9.9.9.9`, `1.1.1.1`) before applying port 53 DROP rules, preventing boot-time name resolution deadlock.
-8. **Loopback & Subsystem Isolation**: Userspace transport shaper rules explicitly exclude loopback traffic (`! -d 127.0.0.0/8`, `! -d ::1/128`) and bypass local resolver/Tor UIDs (`-j RETURN`), preventing proxy feedback loops.
+8. **Stateful Network & VPN Compatibility**: Host firewall and network security controls operate cleanly without intrusive packet mangling, maintaining full compatibility with VPN tunnels (Cloudflare WARP, WireGuard, Tailscale) and local resolver sockets.
 9. **Root Delegation & Anti-Lockout Defense**: Root account password locking enforces pre-flight administrative group membership verification (`sudo`/`wheel`), preserves the `/bin/bash` recovery shell, and quarantines authorized SSH keys to prevent backdoor escalation.
 
 ---
 
 ## Automated Verification & Test Suite
 
-The project features a comprehensive automated regression suite containing **455 validated assertions across 54 test modules**:
+The project features a comprehensive automated regression suite containing **456 validated assertions across 54 test modules**:
 
 ```bash
 # Run the complete test suite
@@ -433,7 +433,8 @@ Validation includes:
 - Network printer (`cups-browsed`) and LocalSend (`avahi-daemon`) discovery preservation
 - DNS privacy hardening: zero-log query/nx logs, local RAM caching, systemd-resolved LLMNR/mDNS/DNSSEC suppression
 - DNS Leak Shield: firewall killswitch blocking cleartext outbound port 53 traffic with bootstrap resolver exceptions
-- Transport Integrity: Tier 1 TCP MSS handshake framing, Tier 2 userspace transport shaper, dual-stack IPv4/IPv6 redirection, and diagnostic probes
+- Legacy Override Excision: Complete removal and automated verification of deprecated DPI bypass tools, netfilter hooks, and legacy services
+- Root user access hardening: verification of sudoer interlock, bash recovery shell preservation, and Whiptail/TUI menu integration
 
 ---
 
@@ -443,7 +444,7 @@ Validation includes:
 - [x] **Profile Presets (v0.2.0)**: One-click switching between *Desk / AC Docked* (60%), *Balanced Daily* (80%), and *Travel / Mobile* (100%).
 - [x] **Font Anti-Blur & Ozone Flags (v0.3.2)**: Subpixel LCD font anti-blur with Flatpak sandbox fontconfig overrides.
 - [x] **Universal OS Engine (v0.5.0)**: Consolidated architecture supporting Pop!_OS, Linux Mint, Ubuntu, and Debian with SSH inbound shielding.
-- [x] **DNS Leak Shield & Transport Integrity (v0.5.1)**: Zero-log RAM caching, strict port 53 killswitch with bootstrap deadlock protection, in-kernel TCP MSS framing (Tier 1), and userspace transport shaper (Tier 2).
+- [x] **DNS Leak Shield & Privacy Hardening (v0.5.1)**: Zero-log RAM caching, strict port 53 killswitch with bootstrap deadlock protection, and encrypted DNS over Tor onion routing.
 - [x] **DNS Boot Deadlock & Hostname Resolution Fix (v0.5.2)**: Eliminate boot-time resolver circular locks and synchronous Firefox profile lock latency with dynamic `/etc/hosts` mapping and dnscrypt bootstrap fallbacks.
 - [ ] **Wayland Root GUI Autofix (Planned for v0.6.0)**: Seamless display authorization and `xhost +si:localuser:root` compatibility for administrative root GUI apps (`gufw`, `synaptic`, `timeshift-gtk`, `gparted`, `bleachbit`) under Wayland / COSMIC sessions (see [TODO.md](TODO.md)).
 - [ ] **Hardware Sensor Monitoring**: Real-time thermal zone readings and battery discharge rate graphing within the TUI dashboard.
