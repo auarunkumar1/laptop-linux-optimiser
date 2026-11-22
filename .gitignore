@@ -1,0 +1,13 @@
+.DS_Store
+Thumbs.db
+.env
+.env.*
+*.log
+.ipynb_checkpoints/
+playwright-report/
+test-results/
+coverage/
+.nyc_output/
+.mugil/
+*.tmp.*
+*.bak
